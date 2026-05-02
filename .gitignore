@@ -3,3 +3,5 @@
 /profiles
 *.aria2
 *.tmp
+/fuzzlogs
+/testdata

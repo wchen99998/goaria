@@ -1,0 +1,642 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://goaria.local/schemas/aria2-jsonrpc.schema.json",
+  "title": "goaria aria2-compatible JSON-RPC request",
+  "description": "JSON-RPC 2.0 request and batch request schema for the aria2 JSON-RPC method surface implemented by goaria. Method signatures are based on the aria2 JSON-RPC manual and include goaria's HTTP/S-focused superset options.",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/batchRequest" }
+  ],
+  "$defs": {
+    "batchRequest": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/request" }
+    },
+    "request": {
+      "oneOf": [
+        { "$ref": "#/$defs/addUri" },
+        { "$ref": "#/$defs/addTorrent" },
+        { "$ref": "#/$defs/addMetalink" },
+        { "$ref": "#/$defs/gidOnly" },
+        { "$ref": "#/$defs/noArgAria" },
+        { "$ref": "#/$defs/tellStatus" },
+        { "$ref": "#/$defs/tellList" },
+        { "$ref": "#/$defs/changePosition" },
+        { "$ref": "#/$defs/changeUri" },
+        { "$ref": "#/$defs/changeOption" },
+        { "$ref": "#/$defs/changeGlobalOption" },
+        { "$ref": "#/$defs/systemMulticall" },
+        { "$ref": "#/$defs/systemNoArg" }
+      ]
+    },
+    "base": {
+      "type": "object",
+      "required": ["jsonrpc", "method"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/id" },
+        "method": { "type": "string" },
+        "params": { "type": "array" }
+      },
+      "additionalProperties": false
+    },
+    "id": {
+      "type": ["string", "integer", "null"],
+      "maxLength": 64
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^token:.{0,128}$"
+    },
+    "gid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{1,16}$"
+    },
+    "uri": {
+      "type": "string",
+      "format": "uri",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "uriList": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/uri" }
+    },
+    "stringList": {
+      "type": "array",
+      "maxItems": 64,
+      "items": { "type": "string", "maxLength": 256 }
+    },
+    "position": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "optionValue": {
+      "type": ["string", "number", "boolean", "null", "array"],
+      "items": { "type": "string", "maxLength": 512 }
+    },
+    "options": {
+      "type": "object",
+      "maxProperties": 128,
+      "additionalProperties": { "$ref": "#/$defs/optionValue" },
+      "properties": {
+        "all-proxy": { "type": "string", "maxLength": 2048 },
+        "all-proxy-passwd": { "type": "string", "maxLength": 256 },
+        "all-proxy-user": { "type": "string", "maxLength": 256 },
+        "allow-overwrite": { "$ref": "#/$defs/boolString" },
+        "auto-file-renaming": { "$ref": "#/$defs/boolString" },
+        "check-certificate": { "$ref": "#/$defs/boolString" },
+        "checksum": { "type": "string", "maxLength": 512 },
+        "conditional-get": { "$ref": "#/$defs/boolString" },
+        "connect-timeout": { "$ref": "#/$defs/nonNegativeString" },
+        "continue": { "$ref": "#/$defs/boolString" },
+        "dir": { "type": "string", "maxLength": 4096 },
+        "dry-run": { "$ref": "#/$defs/boolString" },
+        "enable-http-keep-alive": { "$ref": "#/$defs/boolString" },
+        "gid": { "$ref": "#/$defs/gid" },
+        "header": { "$ref": "#/$defs/stringList" },
+        "http-accept-gzip": { "$ref": "#/$defs/boolString" },
+        "http-auth-challenge": { "$ref": "#/$defs/boolString" },
+        "http-no-cache": { "$ref": "#/$defs/boolString" },
+        "http-passwd": { "type": "string", "maxLength": 256 },
+        "http-proxy": { "type": "string", "maxLength": 2048 },
+        "http-proxy-passwd": { "type": "string", "maxLength": 256 },
+        "http-proxy-user": { "type": "string", "maxLength": 256 },
+        "http-user": { "type": "string", "maxLength": 256 },
+        "http-version": { "enum": ["auto", "1", "1.1", "2", "2.0", "3", "3.0", "http/1.1", "http/2", "http/3", "h1", "h2", "h3"] },
+        "https-proxy": { "type": "string", "maxLength": 2048 },
+        "https-proxy-passwd": { "type": "string", "maxLength": 256 },
+        "https-proxy-user": { "type": "string", "maxLength": 256 },
+        "lowest-speed-limit": { "$ref": "#/$defs/nonNegativeString" },
+        "max-concurrent-downloads": { "$ref": "#/$defs/nonNegativeString" },
+        "max-connection-per-server": { "$ref": "#/$defs/nonNegativeString" },
+        "max-download-limit": { "$ref": "#/$defs/sizeString" },
+        "max-download-result": { "$ref": "#/$defs/nonNegativeString" },
+        "max-file-not-found": { "$ref": "#/$defs/nonNegativeString" },
+        "max-overall-download-limit": { "$ref": "#/$defs/sizeString" },
+        "max-tries": { "$ref": "#/$defs/nonNegativeString" },
+        "min-split-size": { "$ref": "#/$defs/sizeString" },
+        "no-proxy": { "type": "string", "maxLength": 2048 },
+        "out": { "type": "string", "maxLength": 4096 },
+        "referer": { "type": "string", "maxLength": 2048 },
+        "remote-time": { "$ref": "#/$defs/boolString" },
+        "retry-wait": { "$ref": "#/$defs/nonNegativeString" },
+        "save-session": { "type": "string", "maxLength": 4096 },
+        "split": { "$ref": "#/$defs/nonNegativeString" },
+        "timeout": { "$ref": "#/$defs/nonNegativeString" },
+        "use-head": { "$ref": "#/$defs/boolString" },
+        "user-agent": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "boolString": {
+      "type": ["string", "boolean"],
+      "enum": ["true", "false", "yes", "no", "1", "0", true, false]
+    },
+    "nonNegativeString": {
+      "type": ["string", "integer"],
+      "pattern": "^[0-9]+$",
+      "minimum": 0
+    },
+    "sizeString": {
+      "type": ["string", "integer"],
+      "pattern": "^[0-9]+([KkMmGg])?$",
+      "minimum": 0
+    },
+    "addUri": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.addUri" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 3,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/uriList" },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 4,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "$ref": "#/$defs/uriList" },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "addTorrent": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.addTorrent" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 4,
+                  "prefixItems": [
+                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/uriList" },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 5,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/uriList" },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "addMetalink": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.addMetalink" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 3,
+                  "prefixItems": [
+                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 4,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "gidOnly": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "aria2.remove",
+                "aria2.forceRemove",
+                "aria2.pause",
+                "aria2.forcePause",
+                "aria2.unpause",
+                "aria2.getUris",
+                "aria2.getFiles",
+                "aria2.getPeers",
+                "aria2.getServers",
+                "aria2.getOption",
+                "aria2.removeDownloadResult"
+              ]
+            },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 1,
+                  "prefixItems": [{ "$ref": "#/$defs/gid" }]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "$ref": "#/$defs/gid" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "noArgAria": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "aria2.pauseAll",
+                "aria2.forcePauseAll",
+                "aria2.unpauseAll",
+                "aria2.getGlobalOption",
+                "aria2.getGlobalStat",
+                "aria2.purgeDownloadResult",
+                "aria2.getVersion",
+                "aria2.getSessionInfo",
+                "aria2.shutdown",
+                "aria2.forceShutdown",
+                "aria2.saveSession"
+              ]
+            },
+            "params": {
+              "oneOf": [
+                { "type": "array", "maxItems": 0 },
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 1,
+                  "prefixItems": [{ "$ref": "#/$defs/token" }]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "tellStatus": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.tellStatus" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 2,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/gid" },
+                    { "$ref": "#/$defs/stringList" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 3,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "$ref": "#/$defs/gid" },
+                    { "$ref": "#/$defs/stringList" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "tellList": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": {
+              "enum": ["aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"]
+            },
+            "params": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "oneOf": [
+                  { "$ref": "#/$defs/token" },
+                  { "type": "integer" },
+                  { "$ref": "#/$defs/stringList" }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "changePosition": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.changePosition" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 3,
+                  "maxItems": 3,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/gid" },
+                    { "type": "integer" },
+                    { "enum": ["POS_SET", "POS_CUR", "POS_END"] }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 4,
+                  "maxItems": 4,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "$ref": "#/$defs/gid" },
+                    { "type": "integer" },
+                    { "enum": ["POS_SET", "POS_CUR", "POS_END"] }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "changeUri": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.changeUri" },
+            "params": {
+              "type": "array",
+              "minItems": 4,
+              "maxItems": 6,
+              "items": {
+                "oneOf": [
+                  { "$ref": "#/$defs/token" },
+                  { "$ref": "#/$defs/gid" },
+                  { "type": "integer" },
+                  { "$ref": "#/$defs/stringList" },
+                  { "$ref": "#/$defs/position" }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "changeOption": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.changeOption" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/gid" },
+                    { "$ref": "#/$defs/options" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 3,
+                  "maxItems": 3,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "$ref": "#/$defs/gid" },
+                    { "$ref": "#/$defs/options" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "changeGlobalOption": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "aria2.changeGlobalOption" },
+            "params": {
+              "oneOf": [
+                {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 1,
+                  "prefixItems": [{ "$ref": "#/$defs/options" }]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "$ref": "#/$defs/options" }
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "systemMulticall": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "const": "system.multicall" },
+            "params": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "prefixItems": [
+                {
+                  "type": "array",
+                  "maxItems": 64,
+                  "items": {
+                    "type": "object",
+                    "required": ["methodName", "params"],
+                    "properties": {
+                      "methodName": { "$ref": "#/$defs/methodName" },
+                      "params": { "type": "array", "maxItems": 8 }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "systemNoArg": {
+      "allOf": [
+        { "$ref": "#/$defs/base" },
+        {
+          "properties": {
+            "method": { "enum": ["system.listMethods", "system.listNotifications"] },
+            "params": { "type": "array", "maxItems": 0 }
+          }
+        }
+      ]
+    },
+    "methodName": {
+      "enum": [
+        "aria2.addUri",
+        "aria2.addTorrent",
+        "aria2.addMetalink",
+        "aria2.remove",
+        "aria2.forceRemove",
+        "aria2.pause",
+        "aria2.pauseAll",
+        "aria2.forcePause",
+        "aria2.forcePauseAll",
+        "aria2.unpause",
+        "aria2.unpauseAll",
+        "aria2.tellStatus",
+        "aria2.getUris",
+        "aria2.getFiles",
+        "aria2.getPeers",
+        "aria2.getServers",
+        "aria2.tellActive",
+        "aria2.tellWaiting",
+        "aria2.tellStopped",
+        "aria2.changePosition",
+        "aria2.changeUri",
+        "aria2.getOption",
+        "aria2.changeOption",
+        "aria2.getGlobalOption",
+        "aria2.changeGlobalOption",
+        "aria2.getGlobalStat",
+        "aria2.purgeDownloadResult",
+        "aria2.removeDownloadResult",
+        "aria2.getVersion",
+        "aria2.getSessionInfo",
+        "aria2.shutdown",
+        "aria2.forceShutdown",
+        "aria2.saveSession",
+        "system.multicall",
+        "system.listMethods",
+        "system.listNotifications"
+      ]
+    },
+    "response": {
+      "type": "object",
+      "required": ["jsonrpc", "id"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "id": { "$ref": "#/$defs/id" },
+        "result": {},
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "type": "integer" },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "notification": {
+      "type": "object",
+      "required": ["jsonrpc", "method", "params"],
+      "properties": {
+        "jsonrpc": { "const": "2.0" },
+        "method": {
+          "enum": [
+            "aria2.onDownloadStart",
+            "aria2.onDownloadPause",
+            "aria2.onDownloadStop",
+            "aria2.onDownloadComplete",
+            "aria2.onDownloadError",
+            "aria2.onBtDownloadComplete"
+          ]
+        },
+        "params": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "prefixItems": [
+            {
+              "type": "object",
+              "required": ["gid"],
+              "properties": { "gid": { "$ref": "#/$defs/gid" } },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

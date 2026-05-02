@@ -32,6 +32,15 @@ var copyBufferPool = sync.Pool{
 	},
 }
 
+const smallCopyBufferSize = 4 * 1024
+
+var smallCopyBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, smallCopyBufferSize)
+		return &buf
+	},
+}
+
 type remoteMeta struct {
 	Length       int64
 	AcceptRange  bool
@@ -88,7 +97,7 @@ func (l *rateLimiter) wait(n int64) {
 func (e *Engine) runDownload(d *Download) error {
 	d.mu.RLock()
 	ctx := d.ctx
-	opts := cloneOptions(d.options)
+	opts := d.options
 	uris := cloneURIs(d.uris)
 	d.mu.RUnlock()
 	if ctx == nil {
@@ -146,6 +155,33 @@ func (e *Engine) runDownload(d *Download) error {
 }
 
 func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, opts Options) error {
+	split := optionInt(opts, "split", 1)
+	maxConn := optionInt(opts, "max-connection-per-server", split)
+	if split < 1 {
+		split = 1
+	}
+	if maxConn < 1 {
+		maxConn = 1
+	}
+	concurrency := minInt(split, maxConn)
+	minSplit := optionBytes(opts, "min-split-size", 1<<20)
+	limit := optionBytes(opts, "max-download-limit", 0)
+	limiter := newRateLimiter(limit)
+
+	if canUseSingleGETProbe(opts, concurrency) {
+		meta, outPath, err := e.downloadSingleWithGETProbe(ctx, d, rawURI, opts, limiter)
+		if err != nil {
+			return err
+		}
+		if meta.NotModified {
+			return nil
+		}
+		if err := verifyChecksum(outPath, opts); err != nil {
+			return err
+		}
+		return applyRemoteTime(outPath, meta, opts)
+	}
+
 	meta, err := e.probe(ctx, rawURI, opts)
 	if err != nil {
 		return err
@@ -160,19 +196,6 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	}
 
 	d.setMetadata(meta, outPath)
-	split := optionInt(opts, "split", 1)
-	maxConn := optionInt(opts, "max-connection-per-server", split)
-	if split < 1 {
-		split = 1
-	}
-	if maxConn < 1 {
-		maxConn = 1
-	}
-	concurrency := minInt(split, maxConn)
-	minSplit := optionBytes(opts, "min-split-size", 1<<20)
-	limit := optionBytes(opts, "max-download-limit", 0)
-	limiter := newRateLimiter(limit)
-
 	if meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= minSplit*2 {
 		chunks := makeChunks(meta.Length, concurrency, minSplit)
 		err = e.downloadSegmented(ctx, d, meta, outPath, opts, chunks, limiter)
@@ -186,6 +209,13 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 		return err
 	}
 	return applyRemoteTime(outPath, meta, opts)
+}
+
+func canUseSingleGETProbe(opts Options, concurrency int) bool {
+	if concurrency > 1 || optionBool(opts, "dry-run") {
+		return false
+	}
+	return optionString(opts, "out") != "" || !optionBool(opts, "continue")
 }
 
 func (e *Engine) probe(ctx context.Context, rawURI string, opts Options) (remoteMeta, error) {
@@ -292,7 +322,7 @@ func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI string, 
 		return err
 	}
 	defer closeBody()
-	return copyWithProgress(ctx, &offsetWriter{file: file, off: r.start}, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0))
+	return copyWithProgress(ctx, &offsetWriter{file: file, off: r.start}, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
 }
 
 func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, limiter *rateLimiter) error {
@@ -347,15 +377,99 @@ func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMet
 		return err
 	}
 	defer closeBody()
-	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0))
+	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
 	d.setConnections(0)
 	return err
 }
 
-func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64) error {
+func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, rawURI string, opts Options, limiter *rateLimiter) (remoteMeta, string, error) {
+	provisionalPath := resolveOutputPath(optionString(opts, "dir"), optionString(opts, "out"), filenameFromURI(rawURI), rawURI)
+	start := int64(0)
+	if optionBool(opts, "continue") {
+		if st, err := os.Stat(provisionalPath); err == nil && st.Size() > 0 {
+			start = st.Size()
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURI, nil)
+	if err != nil {
+		return remoteMeta{}, "", err
+	}
+	if start > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+	}
+	applyRequestOptions(req, opts)
+	applyConditionalHeaders(req, opts, provisionalPath)
+	resp, err := e.do(req, opts)
+	if err != nil {
+		return remoteMeta{}, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		meta := notModifiedMeta(rawURI, provisionalPath)
+		d.setMetadata(meta, provisionalPath)
+		return meta, provisionalPath, nil
+	}
+	if resp.StatusCode >= 400 {
+		return remoteMeta{}, "", &httpStatusError{Method: http.MethodGet, URL: rawURI, StatusCode: resp.StatusCode, Status: resp.Status}
+	}
+
+	meta := metaFromResponse(resp, rawURI)
+	if resp.StatusCode == http.StatusPartialContent {
+		meta.AcceptRange = true
+		if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
+			meta.Length = total
+		}
+	}
+	outPath := resolveOutputPath(optionString(opts, "dir"), optionString(opts, "out"), meta.Filename, rawURI)
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return remoteMeta{}, "", err
+	}
+
+	flag := os.O_CREATE | os.O_WRONLY
+	if start > 0 && resp.StatusCode == http.StatusPartialContent {
+		flag |= os.O_APPEND
+	} else {
+		start = 0
+		flag |= os.O_TRUNC
+	}
+	file, err := os.OpenFile(outPath, flag, 0o644)
+	if err != nil {
+		return remoteMeta{}, "", err
+	}
+	defer file.Close()
+
+	d.setMetadata(meta, outPath)
+	d.resetSingleProgress(meta.Length, start)
+	d.setConnections(1)
+	body, closeBody, err := responseReader(resp, opts)
+	if err != nil {
+		d.setConnections(0)
+		return remoteMeta{}, "", err
+	}
+	defer closeBody()
+	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
+	d.setConnections(0)
+	if err != nil {
+		return remoteMeta{}, "", err
+	}
+	return meta, outPath, nil
+}
+
+func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, contentLength int64) error {
+	if contentLength > 0 && contentLength <= smallCopyBufferSize {
+		bufp := smallCopyBufferPool.Get().(*[]byte)
+		buf := *bufp
+		defer smallCopyBufferPool.Put(bufp)
+		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
+	}
 	bufp := copyBufferPool.Get().(*[]byte)
 	buf := *bufp
 	defer copyBufferPool.Put(bufp)
+	return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
+}
+
+func copyWithProgressBuffer(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, buf []byte) error {
 	started := time.Now()
 	written := int64(0)
 	speedWindowStart := started

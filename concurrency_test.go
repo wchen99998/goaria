@@ -11,19 +11,27 @@ import (
 	"time"
 )
 
-func TestThousandConcurrentHTTPDownloads(t *testing.T) {
-	runThousandConcurrentHTTPDownloads(t)
+const scaleDownloads = 1250
+
+func TestScaleConcurrentHTTPDownloads(t *testing.T) {
+	runConcurrentHTTPDownloads(t, scaleDownloads)
+}
+
+func BenchmarkScaleConcurrentHTTPDownloads(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		runConcurrentHTTPDownloads(b, scaleDownloads)
+	}
 }
 
 func BenchmarkThousandConcurrentHTTPDownloads(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		runThousandConcurrentHTTPDownloads(b)
+		runConcurrentHTTPDownloads(b, 1000)
 	}
 }
 
-func runThousandConcurrentHTTPDownloads(tb testing.TB) {
-	const downloads = 1000
+func runConcurrentHTTPDownloads(tb testing.TB, downloads int) {
 	data := []byte("scale-ok")
 	var active atomic.Int32
 	var maxActive atomic.Int32
@@ -47,7 +55,7 @@ func runThousandConcurrentHTTPDownloads(tb testing.TB) {
 	defer src.Close()
 
 	dir := tb.TempDir()
-	engine, err := NewEngine(Config{Dir: dir, MaxConcurrentDownloads: downloads})
+	engine, err := NewEngine(Config{Dir: dir, MaxConcurrentDownloads: downloads, MaxDownloadResult: downloads})
 	if err != nil {
 		tb.Fatal(err)
 	}
@@ -73,7 +81,7 @@ func runThousandConcurrentHTTPDownloads(tb testing.TB) {
 	for _, gid := range gids {
 		for {
 			if time.Now().After(deadline) {
-				tb.Fatalf("timed out waiting for 1000 downloads; max active observed %d", maxActive.Load())
+				tb.Fatalf("timed out waiting for %d downloads; max active observed %d", downloads, maxActive.Load())
 			}
 			status, err := engine.TellStatus(gid, []string{"status", "errorMessage"})
 			if err != nil {
@@ -94,7 +102,7 @@ func runThousandConcurrentHTTPDownloads(tb testing.TB) {
 	for i := 0; i < downloads; i++ {
 		assertFileEquals(tb, filepath.Join(dir, fmt.Sprintf("scale-%04d.bin", i)), data)
 	}
-	if maxActive.Load() < 100 {
+	if maxActive.Load() < 125 {
 		tb.Fatalf("expected substantial parallelism, max active observed %d", maxActive.Load())
 	}
 }

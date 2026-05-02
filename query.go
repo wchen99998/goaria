@@ -200,34 +200,69 @@ func (e *Engine) waitingDownloads() []*Download {
 func (d *Download) snapshot(keys []string) map[string]any {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	all := map[string]any{
-		"gid":             d.gid,
-		"status":          string(d.status),
-		"totalLength":     strconv.FormatInt(d.totalLength, 10),
-		"completedLength": strconv.FormatInt(d.completedLen, 10),
-		"uploadLength":    "0",
-		"downloadSpeed":   strconv.FormatInt(d.downloadBPS, 10),
-		"uploadSpeed":     "0",
-		"connections":     strconv.Itoa(d.connections),
-		"numPieces":       strconv.FormatInt(d.numPieces, 10),
-		"pieceLength":     strconv.FormatInt(d.pieceLength, 10),
-		"bitfield":        d.bitfield,
-		"dir":             d.dir,
-		"files":           d.filesLocked(),
-	}
-	if d.errorCode != "" {
-		all["errorCode"] = d.errorCode
-	}
-	if d.errorMessage != "" {
-		all["errorMessage"] = d.errorMessage
-	}
+
 	if len(keys) == 0 {
+		all := map[string]any{
+			"gid":             d.gid,
+			"status":          string(d.status),
+			"totalLength":     strconv.FormatInt(d.totalLength, 10),
+			"completedLength": strconv.FormatInt(d.completedLen, 10),
+			"uploadLength":    "0",
+			"downloadSpeed":   strconv.FormatInt(d.downloadBPS, 10),
+			"uploadSpeed":     "0",
+			"connections":     strconv.Itoa(d.connections),
+			"numPieces":       strconv.FormatInt(d.numPieces, 10),
+			"pieceLength":     strconv.FormatInt(d.pieceLength, 10),
+			"bitfield":        d.bitfield,
+			"dir":             d.dir,
+			"files":           d.filesLocked(),
+		}
+		if d.errorCode != "" {
+			all["errorCode"] = d.errorCode
+		}
+		if d.errorMessage != "" {
+			all["errorMessage"] = d.errorMessage
+		}
 		return all
 	}
+
 	filtered := make(map[string]any, len(keys))
 	for _, key := range keys {
-		if v, ok := all[key]; ok {
-			filtered[key] = v
+		switch key {
+		case "gid":
+			filtered[key] = d.gid
+		case "status":
+			filtered[key] = string(d.status)
+		case "totalLength":
+			filtered[key] = strconv.FormatInt(d.totalLength, 10)
+		case "completedLength":
+			filtered[key] = strconv.FormatInt(d.completedLen, 10)
+		case "uploadLength":
+			filtered[key] = "0"
+		case "downloadSpeed":
+			filtered[key] = strconv.FormatInt(d.downloadBPS, 10)
+		case "uploadSpeed":
+			filtered[key] = "0"
+		case "connections":
+			filtered[key] = strconv.Itoa(d.connections)
+		case "numPieces":
+			filtered[key] = strconv.FormatInt(d.numPieces, 10)
+		case "pieceLength":
+			filtered[key] = strconv.FormatInt(d.pieceLength, 10)
+		case "bitfield":
+			filtered[key] = d.bitfield
+		case "dir":
+			filtered[key] = d.dir
+		case "files":
+			filtered[key] = d.filesLocked()
+		case "errorCode":
+			if d.errorCode != "" {
+				filtered[key] = d.errorCode
+			}
+		case "errorMessage":
+			if d.errorMessage != "" {
+				filtered[key] = d.errorMessage
+			}
 		}
 	}
 	return filtered
@@ -297,8 +332,10 @@ func currentOrOriginal(current, original string) string {
 }
 
 func filenameFromURI(raw string) string {
-	beforeQuery := strings.Split(raw, "?")[0]
-	name := filepath.Base(beforeQuery)
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		raw = raw[:i]
+	}
+	name := filepath.Base(raw)
 	if name == "." || name == "/" || name == "" {
 		return "index.html"
 	}

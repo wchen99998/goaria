@@ -16,11 +16,11 @@ protocol:
 	go test -run 'TestHTTP1Forced|TestHTTP2Download|TestHTTP3Download|TestHTTP3Proxy' -count=5 ./...
 
 scale:
-	go test -run TestThousandConcurrentHTTPDownloads -count=1 .
+	go test -run TestScaleConcurrentHTTPDownloads -count=1 .
 
 profile-scale:
 	mkdir -p profiles
-	go test -run '^$$' -bench BenchmarkThousandConcurrentHTTPDownloads -benchtime=5x -cpuprofile profiles/scale.cpu -memprofile profiles/scale.mem .
+	go test -run '^$$' -bench BenchmarkScaleConcurrentHTTPDownloads -benchtime=5x -cpuprofile profiles/scale.cpu -memprofile profiles/scale.mem .
 
 live-chaos:
 	GOARIA_LIVE_TESTS=1 go test -run 'TestLive' -count=1 .

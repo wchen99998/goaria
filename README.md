@@ -122,8 +122,8 @@ Chaos coverage intentionally injects mid-stream connection drops, transient 503 
 
 Protocol coverage includes local HTTP/1.1, HTTP/2, and HTTP/3 servers. HTTP/3 support uses quic-go's `http3.Transport`, which implements RFC 9114 HTTP/3 over QUIC.
 
-Scale coverage includes a local 1000-download concurrency test through `make scale`.
-`make profile-scale` profiles the 1000-download benchmark and writes CPU/memory profiles under `profiles/`.
+Scale coverage includes a local 1250-download concurrency test through `make scale`.
+`make profile-scale` profiles the 1250-download benchmark and writes CPU/memory profiles under `profiles/`.
 
 Live public-internet checks are opt-in to keep the default suite deterministic:
 

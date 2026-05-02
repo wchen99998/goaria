@@ -13,7 +13,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 func TestRPCMethodSurfaceAndToken(t *testing.T) {

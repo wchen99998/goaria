@@ -7,7 +7,7 @@ import (
 	"io"
 	"strconv"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 func stringParam(params []json.RawMessage, i int) (string, error) {

@@ -15,7 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 const (

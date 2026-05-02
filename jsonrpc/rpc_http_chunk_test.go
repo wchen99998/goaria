@@ -9,7 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 func TestJSONRPCPostBodyChunks(t *testing.T) {

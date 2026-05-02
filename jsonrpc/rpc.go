@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 const (

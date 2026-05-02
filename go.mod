@@ -1,4 +1,4 @@
-module goaria
+module github.com/wchen99998/goaria
 
 go 1.26.1
 

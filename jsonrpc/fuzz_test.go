@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"testing"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 func FuzzParseJSONRPCCall(f *testing.F) {

@@ -1,6 +1,6 @@
 # goaria
 
-`goaria` is an aria2-compatible download engine written in Go. It can be embedded directly as a library or run as a CLI daemon, and JSON-RPC is provided by an optional `goaria/jsonrpc` package.
+`goaria` is an aria2-compatible download engine written in Go. It can be embedded directly as a library or run as a CLI daemon, and JSON-RPC is provided by an optional `github.com/wchen99998/goaria/jsonrpc` package.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ The JSON-RPC endpoint is `/jsonrpc`, matching aria2. HTTP POST, HTTP GET with ba
 Use the root package when embedding the downloader without an RPC server:
 
 ```go
-import "goaria"
+import "github.com/wchen99998/goaria"
 
 engine, err := goaria.NewEngine(goaria.Config{Dir: "./downloads", Logger: logger})
 if err != nil {
@@ -44,7 +44,7 @@ gid, err := engine.AddURI([]string{"https://example.com/file.bin"}, goaria.Optio
 To expose JSON-RPC, import the optional adapter package:
 
 ```go
-import "goaria/jsonrpc"
+import "github.com/wchen99998/goaria/jsonrpc"
 
 srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: ":6800", Secret: "secret"})
 err := srv.ListenAndServe(ctx)

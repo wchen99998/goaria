@@ -14,8 +14,8 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"goaria"
-	"goaria/jsonrpc"
+	"github.com/wchen99998/goaria"
+	"github.com/wchen99998/goaria/jsonrpc"
 )
 
 func main() {

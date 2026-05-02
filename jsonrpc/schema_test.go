@@ -9,7 +9,7 @@ import (
 	chaff "github.com/ryanolee/go-chaff"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
-	"goaria"
+	"github.com/wchen99998/goaria"
 )
 
 func TestJSONRPCSchemaWithGoChaff(t *testing.T) {

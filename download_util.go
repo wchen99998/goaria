@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -48,7 +47,36 @@ func resolveOutputPath(dir, out, filename, rawURI string) string {
 	if filepath.IsAbs(out) {
 		return filepath.Clean(out)
 	}
+	if isSimpleRelativeName(out) && dir != "" && dir != "." {
+		return dir + string(os.PathSeparator) + out
+	}
 	return filepath.Join(dir, filepath.Clean(out))
+}
+
+func isSimpleRelativeName(name string) bool {
+	return name != "" &&
+		name != "." &&
+		name != ".." &&
+		!strings.ContainsAny(name, `/\`)
+}
+
+func (e *Engine) ensureDownloadDir(dir string) error {
+	dir = filepath.Clean(dir)
+	e.dirMu.Lock()
+	if _, ok := e.createdDir[dir]; ok {
+		e.dirMu.Unlock()
+		return nil
+	}
+	e.dirMu.Unlock()
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
+	e.dirMu.Lock()
+	e.createdDir[dir] = struct{}{}
+	e.dirMu.Unlock()
+	return nil
 }
 
 func makeChunks(total int64, concurrency int, minSplit int64) []chunkRange {
@@ -58,12 +86,12 @@ func makeChunks(total int64, concurrency int, minSplit int64) []chunkRange {
 	if minSplit <= 0 {
 		minSplit = 1 << 20
 	}
-	maxChunks := int(math.Ceil(float64(total) / float64(minSplit)))
+	maxChunks := int(ceilDivInt64(total, minSplit))
 	if maxChunks < 1 {
 		maxChunks = 1
 	}
 	count := minInt(concurrency, maxChunks)
-	chunkSize := int64(math.Ceil(float64(total) / float64(count)))
+	chunkSize := ceilDivInt64(total, int64(count))
 	chunks := make([]chunkRange, 0, count)
 	for start := int64(0); start < total; start += chunkSize {
 		end := start + chunkSize - 1
@@ -79,22 +107,38 @@ func bitfieldFor(total, completed, pieceLength int64) string {
 	if total <= 0 || pieceLength <= 0 {
 		return ""
 	}
-	pieces := int(math.Ceil(float64(total) / float64(pieceLength)))
+	pieces := int(ceilDivInt64(total, pieceLength))
 	if pieces <= 0 {
 		return ""
 	}
 	bytesLen := (pieces + 7) / 8
 	bits := make([]byte, bytesLen)
-	completePieces := int(completed / pieceLength)
-	if completed >= total {
-		completePieces = pieces
-	}
+	completePieces := int(completedPieces(total, completed, pieceLength))
 	for i := 0; i < completePieces; i++ {
 		byteIndex := i / 8
 		bit := uint(7 - (i % 8))
 		bits[byteIndex] |= 1 << bit
 	}
-	return fmt.Sprintf("%x", bits)
+	return hex.EncodeToString(bits)
+}
+
+func completedPieces(total, completed, pieceLength int64) int64 {
+	if total <= 0 || completed <= 0 || pieceLength <= 0 {
+		return 0
+	}
+	pieces := ceilDivInt64(total, pieceLength)
+	done := completed / pieceLength
+	if completed >= total || done > pieces {
+		return pieces
+	}
+	return done
+}
+
+func ceilDivInt64(n, d int64) int64 {
+	if n <= 0 || d <= 0 {
+		return 0
+	}
+	return 1 + (n-1)/d
 }
 
 func minInt(a, b int) int {

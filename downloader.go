@@ -32,6 +32,15 @@ var copyBufferPool = sync.Pool{
 	},
 }
 
+const largeCopyBufferSize = 256 * 1024
+
+var largeCopyBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, largeCopyBufferSize)
+		return &buf
+	},
+}
+
 const smallCopyBufferSize = 4 * 1024
 
 var smallCopyBufferPool = sync.Pool{
@@ -53,17 +62,6 @@ type remoteMeta struct {
 type chunkRange struct {
 	start int64
 	end   int64
-}
-
-type offsetWriter struct {
-	file *os.File
-	off  int64
-}
-
-func (w *offsetWriter) Write(p []byte) (int, error) {
-	n, err := w.file.WriteAt(p, w.off)
-	w.off += int64(n)
-	return n, err
 }
 
 type rateLimiter struct {
@@ -95,10 +93,17 @@ func (l *rateLimiter) wait(n int64) {
 }
 
 func (e *Engine) runDownload(d *Download) error {
+	var oneURI [1]URIInfo
+	var uris []URIInfo
 	d.mu.RLock()
 	ctx := d.ctx
 	opts := d.options
-	uris := cloneURIs(d.uris)
+	if len(d.uris) == 1 {
+		oneURI[0] = d.uris[0]
+		uris = oneURI[:]
+	} else {
+		uris = cloneURIs(d.uris)
+	}
 	d.mu.RUnlock()
 	if ctx == nil {
 		return context.Canceled
@@ -122,7 +127,9 @@ func (e *Engine) runDownload(d *Download) error {
 				break
 			}
 			attempt++
-			d.setURIUsed(u.URI)
+			if len(uris) > 1 {
+				d.setURIUsed(u.URI)
+			}
 			err := e.downloadURI(ctx, d, u.URI, opts)
 			if err == nil {
 				return nil
@@ -134,7 +141,9 @@ func (e *Engine) runDownload(d *Download) error {
 					return err
 				}
 			}
-			e.log.Warn("download URI failed", zap.String("gid", d.gid), zap.String("uri", u.URI), zap.Int("attempt", attempt), zap.Error(err))
+			if ce := e.log.Check(zap.WarnLevel, "download URI failed"); ce != nil {
+				ce.Write(zap.String("gid", d.gid), zap.String("uri", u.URI), zap.Int("attempt", attempt), zap.Error(err))
+			}
 			if isRetryableDownloadError(err) {
 				roundRetryable = true
 			}
@@ -167,9 +176,11 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	minSplit := optionBytes(opts, "min-split-size", 1<<20)
 	limit := optionBytes(opts, "max-download-limit", 0)
 	limiter := newRateLimiter(limit)
+	dirOpt := optionString(opts, "dir")
+	outOpt := optionString(opts, "out")
 
 	if canUseSingleGETProbe(opts, concurrency) {
-		meta, outPath, err := e.downloadSingleWithGETProbe(ctx, d, rawURI, opts, limiter)
+		meta, outPath, err := e.downloadSingleWithGETProbe(ctx, d, rawURI, opts, dirOpt, outOpt, limiter)
 		if err != nil {
 			return err
 		}
@@ -182,21 +193,30 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 		return applyRemoteTime(outPath, meta, opts)
 	}
 
-	meta, err := e.probe(ctx, rawURI, opts)
+	provisionalName := filenameFromURI(rawURI)
+	provisionalPath := resolveOutputPath(dirOpt, outOpt, provisionalName, rawURI)
+	meta, err := e.probe(ctx, rawURI, opts, provisionalPath)
 	if err != nil {
 		return err
 	}
-	outPath := resolveOutputPath(optionString(opts, "dir"), optionString(opts, "out"), meta.Filename, rawURI)
+	outPath := provisionalPath
+	if outOpt == "" && meta.Filename != "" && meta.Filename != provisionalName {
+		outPath = resolveOutputPath(dirOpt, "", meta.Filename, rawURI)
+	}
 	if optionBool(opts, "dry-run") || meta.NotModified {
 		d.setMetadata(meta, outPath)
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+	if err := e.ensureDownloadDir(filepath.Dir(outPath)); err != nil {
 		return err
 	}
 
 	d.setMetadata(meta, outPath)
-	if meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= minSplit*2 {
+	segmentedMin := minSplit * 2
+	if !optionExplicit(opts, "min-split-size") && segmentedMin < 8<<20 {
+		segmentedMin = 8 << 20
+	}
+	if meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= segmentedMin {
 		chunks := makeChunks(meta.Length, concurrency, minSplit)
 		err = e.downloadSegmented(ctx, d, meta, outPath, opts, chunks, limiter)
 	} else {
@@ -218,8 +238,7 @@ func canUseSingleGETProbe(opts Options, concurrency int) bool {
 	return optionString(opts, "out") != "" || !optionBool(opts, "continue")
 }
 
-func (e *Engine) probe(ctx context.Context, rawURI string, opts Options) (remoteMeta, error) {
-	conditionalPath := resolveOutputPath(optionString(opts, "dir"), optionString(opts, "out"), filenameFromURI(rawURI), rawURI)
+func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditionalPath string) (remoteMeta, error) {
 	if optionBoolDefault(opts, "use-head", true) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURI, nil)
 		if err != nil {
@@ -275,8 +294,11 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 	if err := file.Truncate(meta.Length); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
 		return err
 	}
 	d.resetProgress(meta.Length, chunks)
@@ -288,7 +310,7 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 		wg.Add(1)
 		go func(r chunkRange) {
 			defer wg.Done()
-			errCh <- e.downloadRange(ctx, d, meta.FinalURI, opts, file, r, limiter)
+			errCh <- e.downloadRange(ctx, d, meta.FinalURI, path, opts, r, limiter)
 		}(ch)
 	}
 	wg.Wait()
@@ -302,7 +324,7 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 	return nil
 }
 
-func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI string, opts Options, file *os.File, r chunkRange, limiter *rateLimiter) error {
+func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI, path string, opts Options, r chunkRange, limiter *rateLimiter) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURI, nil)
 	if err != nil {
 		return err
@@ -322,7 +344,15 @@ func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI string, 
 		return err
 	}
 	defer closeBody()
-	return copyWithProgress(ctx, &offsetWriter{file: file, off: r.start}, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
+	file, err := os.OpenFile(path, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.Seek(r.start, io.SeekStart); err != nil {
+		return err
+	}
+	return copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
 }
 
 func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, limiter *rateLimiter) error {
@@ -382,10 +412,28 @@ func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMet
 	return err
 }
 
-func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, rawURI string, opts Options, limiter *rateLimiter) (remoteMeta, string, error) {
-	provisionalPath := resolveOutputPath(optionString(opts, "dir"), optionString(opts, "out"), filenameFromURI(rawURI), rawURI)
+func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, rawURI string, opts Options, dirOpt, outOpt string, limiter *rateLimiter) (remoteMeta, string, error) {
+	provisionalName := filenameFromURI(rawURI)
+	provisionalPath := resolveOutputPath(dirOpt, outOpt, provisionalName, rawURI)
 	start := int64(0)
-	if optionBool(opts, "continue") {
+	var file *os.File
+	createdNew := false
+	if canCreateSingleDestinationBeforeGET(opts, outOpt) {
+		if err := e.ensureDownloadDir(filepath.Dir(provisionalPath)); err != nil {
+			return remoteMeta{}, "", err
+		}
+		f, err := os.OpenFile(provisionalPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			file = f
+			createdNew = true
+		} else if os.IsExist(err) {
+			if st, statErr := os.Stat(provisionalPath); statErr == nil && st.Size() > 0 {
+				start = st.Size()
+			}
+		} else {
+			return remoteMeta{}, "", err
+		}
+	} else if optionBool(opts, "continue") {
 		if st, err := os.Stat(provisionalPath); err == nil && st.Size() > 0 {
 			start = st.Size()
 		}
@@ -402,15 +450,27 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 	applyConditionalHeaders(req, opts, provisionalPath)
 	resp, err := e.do(req, opts)
 	if err != nil {
+		if createdNew {
+			_ = file.Close()
+			_ = os.Remove(provisionalPath)
+		}
 		return remoteMeta{}, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotModified {
+		if createdNew {
+			_ = file.Close()
+			_ = os.Remove(provisionalPath)
+		}
 		meta := notModifiedMeta(rawURI, provisionalPath)
 		d.setMetadata(meta, provisionalPath)
 		return meta, provisionalPath, nil
 	}
 	if resp.StatusCode >= 400 {
+		if createdNew {
+			_ = file.Close()
+			_ = os.Remove(provisionalPath)
+		}
 		return remoteMeta{}, "", &httpStatusError{Method: http.MethodGet, URL: rawURI, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
@@ -421,21 +481,35 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 			meta.Length = total
 		}
 	}
-	outPath := resolveOutputPath(optionString(opts, "dir"), optionString(opts, "out"), meta.Filename, rawURI)
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return remoteMeta{}, "", err
+	outPath := provisionalPath
+	if outOpt == "" && meta.Filename != "" && meta.Filename != provisionalName {
+		outPath = resolveOutputPath(dirOpt, "", meta.Filename, rawURI)
+	}
+	if file == nil {
+		if err := e.ensureDownloadDir(filepath.Dir(outPath)); err != nil {
+			return remoteMeta{}, "", err
+		}
 	}
 
-	flag := os.O_CREATE | os.O_WRONLY
-	if start > 0 && resp.StatusCode == http.StatusPartialContent {
-		flag |= os.O_APPEND
-	} else {
+	if file == nil {
+		flag := os.O_CREATE | os.O_WRONLY
+		if start > 0 && resp.StatusCode == http.StatusPartialContent {
+			flag |= os.O_APPEND
+		} else {
+			start = 0
+			flag |= os.O_TRUNC
+		}
+		file, err = os.OpenFile(outPath, flag, 0o644)
+		if err != nil {
+			return remoteMeta{}, "", err
+		}
+	} else if start > 0 && resp.StatusCode != http.StatusPartialContent {
 		start = 0
-		flag |= os.O_TRUNC
-	}
-	file, err := os.OpenFile(outPath, flag, 0o644)
-	if err != nil {
-		return remoteMeta{}, "", err
+		if err := file.Truncate(0); err != nil {
+			_ = file.Close()
+			_ = os.Remove(outPath)
+			return remoteMeta{}, "", err
+		}
 	}
 	defer file.Close()
 
@@ -445,6 +519,9 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 	body, closeBody, err := responseReader(resp, opts)
 	if err != nil {
 		d.setConnections(0)
+		if createdNew {
+			_ = os.Remove(outPath)
+		}
 		return remoteMeta{}, "", err
 	}
 	defer closeBody()
@@ -456,11 +533,21 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 	return meta, outPath, nil
 }
 
+func canCreateSingleDestinationBeforeGET(opts Options, out string) bool {
+	return out != "" && optionBool(opts, "continue") && !optionBool(opts, "conditional-get")
+}
+
 func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, contentLength int64) error {
 	if contentLength > 0 && contentLength <= smallCopyBufferSize {
 		bufp := smallCopyBufferPool.Get().(*[]byte)
 		buf := *bufp
 		defer smallCopyBufferPool.Put(bufp)
+		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
+	}
+	if contentLength >= 512<<10 {
+		bufp := largeCopyBufferPool.Get().(*[]byte)
+		buf := *bufp
+		defer largeCopyBufferPool.Put(bufp)
 		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
 	}
 	bufp := copyBufferPool.Get().(*[]byte)
@@ -470,47 +557,71 @@ func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Down
 }
 
 func copyWithProgressBuffer(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, buf []byte) error {
+	const progressFlushBytes = 1 * 1024 * 1024
+
 	started := time.Now()
 	written := int64(0)
+	pendingProgress := int64(0)
 	speedWindowStart := started
 	speedWindowBytes := int64(0)
+	flushProgress := func() {
+		if pendingProgress > 0 {
+			d.addCompleted(pendingProgress)
+			pendingProgress = 0
+		}
+	}
+	checkSpeed := func(now time.Time) error {
+		if windowElapsed := now.Sub(speedWindowStart); windowElapsed >= time.Second {
+			d.setDownloadBPS(speedWindowBytes * int64(time.Second) / int64(windowElapsed))
+			speedWindowStart = now
+			speedWindowBytes = 0
+		}
+		if lowestSpeed > 0 {
+			if elapsed := now.Sub(started); elapsed >= time.Second {
+				avg := written * int64(time.Second) / int64(elapsed)
+				if avg <= lowestSpeed {
+					return fmt.Errorf("download speed %d is below lowest-speed-limit %d", avg, lowestSpeed)
+				}
+			}
+		}
+		return nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
+			flushProgress()
 			return err
 		}
 		nr, er := src.Read(buf)
 		if nr > 0 {
 			nw, ew := dst.Write(buf[:nr])
 			if nw > 0 {
-				d.addCompleted(int64(nw))
-				written += int64(nw)
-				speedWindowBytes += int64(nw)
-				limiter.wait(int64(nw))
-				elapsed := time.Since(started)
-				windowElapsed := time.Since(speedWindowStart)
-				if windowElapsed >= time.Second {
-					d.setDownloadBPS(speedWindowBytes * int64(time.Second) / int64(windowElapsed))
-					speedWindowStart = time.Now()
-					speedWindowBytes = 0
-				}
-				if lowestSpeed > 0 && elapsed >= time.Second {
-					avg := written * int64(time.Second) / int64(elapsed)
-					if avg <= lowestSpeed {
-						return fmt.Errorf("download speed %d is below lowest-speed-limit %d", avg, lowestSpeed)
+				n := int64(nw)
+				pendingProgress += n
+				written += n
+				speedWindowBytes += n
+				limiter.wait(n)
+				if pendingProgress >= progressFlushBytes || lowestSpeed > 0 {
+					flushProgress()
+					if err := checkSpeed(time.Now()); err != nil {
+						return err
 					}
 				}
 			}
 			if ew != nil {
+				flushProgress()
 				return ew
 			}
 			if nr != nw {
+				flushProgress()
 				return io.ErrShortWrite
 			}
 		}
 		if er != nil {
 			if errors.Is(er, io.EOF) {
+				flushProgress()
 				return nil
 			}
+			flushProgress()
 			return er
 		}
 	}

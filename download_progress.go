@@ -27,6 +27,7 @@ func (d *Download) setMetadata(meta remoteMeta, path string) {
 	}
 	d.pieceLength = 0
 	d.numPieces = 0
+	d.donePieces = 0
 	d.bitfield = ""
 }
 
@@ -42,6 +43,7 @@ func (d *Download) resetProgress(total int64, chunks []chunkRange) {
 		d.pieceLength = total
 		d.numPieces = 1
 	}
+	d.donePieces = completedPieces(d.totalLength, d.completedLen, d.pieceLength)
 	d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
 }
 
@@ -53,11 +55,15 @@ func (d *Download) resetSingleProgress(total, completed int64) {
 	if total > 0 {
 		d.pieceLength = total
 		d.numPieces = 1
+		d.donePieces = completedPieces(total, completed, total)
 		d.bitfield = bitfieldFor(total, completed, total)
 	}
 }
 
 func (d *Download) addCompleted(n int64) {
+	if n <= 0 {
+		return
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.completedLen += n
@@ -65,7 +71,11 @@ func (d *Download) addCompleted(n int64) {
 		d.completedLen = d.totalLength
 	}
 	if d.pieceLength > 0 {
-		d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
+		done := completedPieces(d.totalLength, d.completedLen, d.pieceLength)
+		if done != d.donePieces {
+			d.donePieces = done
+			d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
+		}
 	}
 }
 

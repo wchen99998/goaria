@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const scaleDownloads = 1250
+const scaleDownloads = 1750
 
 func TestScaleConcurrentHTTPDownloads(t *testing.T) {
 	runConcurrentHTTPDownloads(t, scaleDownloads)
@@ -63,8 +63,10 @@ func runConcurrentHTTPDownloads(tb testing.TB, downloads int) {
 	if _, err := engine.ChangeGlobalOption(Options{"max-concurrent-downloads": fmt.Sprint(downloads)}); err != nil {
 		tb.Fatal(err)
 	}
+	events, cancelEvents := engine.Subscribe(downloads * 2)
+	defer cancelEvents()
 
-	gids := make([]string, 0, downloads)
+	pending := make(map[string]struct{}, downloads)
 	for i := 0; i < downloads; i++ {
 		gid, err := engine.AddURI([]string{src.URL + "/scale"}, Options{
 			"out":       fmt.Sprintf("scale-%04d.bin", i),
@@ -74,29 +76,29 @@ func runConcurrentHTTPDownloads(tb testing.TB, downloads int) {
 		if err != nil {
 			tb.Fatalf("add %d: %v", i, err)
 		}
-		gids = append(gids, gid)
+		pending[gid] = struct{}{}
 	}
 
-	deadline := time.Now().Add(20 * time.Second)
-	for _, gid := range gids {
-		for {
-			if time.Now().After(deadline) {
-				tb.Fatalf("timed out waiting for %d downloads; max active observed %d", downloads, maxActive.Load())
+	deadline := time.After(20 * time.Second)
+	for len(pending) > 0 {
+		select {
+		case n := <-events:
+			if _, ok := pending[n.GID]; !ok {
+				continue
 			}
-			status, err := engine.TellStatus(gid, []string{"status", "errorMessage"})
-			if err != nil {
-				tb.Fatal(err)
+			switch n.Method {
+			case "aria2.onDownloadComplete":
+				delete(pending, n.GID)
+			case "aria2.onDownloadError":
+				status, err := engine.TellStatus(n.GID, []string{"errorMessage"})
+				if err != nil {
+					tb.Fatal(err)
+				}
+				tb.Fatalf("download %s errored: %v", n.GID, status["errorMessage"])
 			}
-			switch status["status"] {
-			case string(StatusComplete):
-				goto next
-			case string(StatusError):
-				tb.Fatalf("download %s errored: %v", gid, status["errorMessage"])
-			default:
-				time.Sleep(10 * time.Millisecond)
-			}
+		case <-deadline:
+			tb.Fatalf("timed out waiting for %d downloads; %d pending; max active observed %d", downloads, len(pending), maxActive.Load())
 		}
-	next:
 	}
 
 	for i := 0; i < downloads; i++ {

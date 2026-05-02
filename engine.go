@@ -42,6 +42,9 @@ type Engine struct {
 	h2Transports map[string]*http2.Transport
 	h3Transports map[string]*http3.Transport
 
+	dirMu      sync.Mutex
+	createdDir map[string]struct{}
+
 	subMu       sync.Mutex
 	subscribers map[chan Notification]struct{}
 }
@@ -64,6 +67,7 @@ type Download struct {
 	connections  int
 	pieceLength  int64
 	numPieces    int64
+	donePieces   int64
 	bitfield     string
 
 	errorCode    string
@@ -111,6 +115,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 				IdleConnTimeout:       90 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 				ForceAttemptHTTP2:     true,
+				DisableCompression:    true,
 			},
 		}
 	}
@@ -133,6 +138,7 @@ func NewEngine(cfg Config) (*Engine, error) {
 		transports:       make(map[string]*http.Transport),
 		h2Transports:     make(map[string]*http2.Transport),
 		h3Transports:     make(map[string]*http3.Transport),
+		createdDir:       make(map[string]struct{}),
 		subscribers:      make(map[chan Notification]struct{}),
 	}
 	e.global["user-agent"] = cfg.UserAgent
@@ -187,7 +193,7 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 	if err := e.ctx.Err(); err != nil {
 		return "", ErrShutdown
 	}
-	merged := mergeOptions(e.global, opts)
+	merged := layerOptions(e.global, opts)
 	gid := optionString(merged, "gid")
 	if gid == "" {
 		gid = randomHex(8)
@@ -204,7 +210,9 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 		e.insertWaitingLocked(gid, position)
 	}
 	e.downloads[gid] = d
-	e.log.Info("download added", zap.String("gid", gid), zap.Strings("uris", uris))
+	if ce := e.log.Check(zap.InfoLevel, "download added"); ce != nil {
+		ce.Write(zap.String("gid", gid), zap.Strings("uris", uris))
+	}
 	e.signal()
 	return gid, nil
 }
@@ -461,7 +469,7 @@ func (e *Engine) SaveSession() (string, error) {
 		}
 		if len(d.uris) > 0 {
 			_, _ = fmt.Fprintln(f, d.uris[0].URI)
-			for k, v := range d.options {
+			for k, v := range optionsForRPC(d.options) {
 				if k == "gid" {
 					continue
 				}

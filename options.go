@@ -12,6 +12,8 @@ import (
 // options like "header", aria2 also accepts an array of strings.
 type Options map[string]any
 
+const optionBaseKey = "\x00goaria.base-options"
+
 func defaultOptions(dir string, maxConcurrent, maxResult int) Options {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 5
@@ -50,6 +52,10 @@ func defaultOptions(dir string, maxConcurrent, maxResult int) Options {
 func cloneOptions(in Options) Options {
 	out := make(Options, len(in))
 	for k, v := range in {
+		if k == optionBaseKey {
+			out[k] = v
+			continue
+		}
 		switch vv := v.(type) {
 		case []string:
 			cp := append([]string(nil), vv...)
@@ -64,9 +70,24 @@ func cloneOptions(in Options) Options {
 	return out
 }
 
+func layerOptions(base Options, overlay Options) Options {
+	out := make(Options, len(overlay)+1)
+	out[optionBaseKey] = base
+	for k, v := range overlay {
+		if k == optionBaseKey {
+			continue
+		}
+		out[k] = normalizeOptionValue(v)
+	}
+	return out
+}
+
 func mergeOptions(base Options, overlay Options) Options {
 	out := cloneOptions(base)
 	for k, v := range overlay {
+		if k == optionBaseKey {
+			continue
+		}
 		out[k] = normalizeOptionValue(v)
 	}
 	return out
@@ -110,14 +131,31 @@ func normalizeOptionValue(v any) any {
 func normalizeOptions(in map[string]any) Options {
 	out := make(Options, len(in))
 	for k, v := range in {
+		if k == optionBaseKey {
+			continue
+		}
 		out[k] = normalizeOptionValue(v)
 	}
 	return out
 }
 
-func optionString(opts Options, key string) string {
+func optionValue(opts Options, key string) (any, bool) {
+	if opts == nil {
+		return nil, false
+	}
 	v, ok := opts[key]
-	if !ok || v == nil {
+	if ok {
+		return v, v != nil
+	}
+	if base, ok := opts[optionBaseKey].(Options); ok {
+		return optionValue(base, key)
+	}
+	return nil, false
+}
+
+func optionString(opts Options, key string) string {
+	v, ok := optionValue(opts, key)
+	if !ok {
 		return ""
 	}
 	switch x := v.(type) {
@@ -131,13 +169,21 @@ func optionString(opts Options, key string) string {
 }
 
 func optionPresent(opts Options, key string) bool {
+	_, ok := optionValue(opts, key)
+	return ok
+}
+
+func optionExplicit(opts Options, key string) bool {
+	if opts == nil {
+		return false
+	}
 	_, ok := opts[key]
 	return ok
 }
 
 func optionStringList(opts Options, key string) []string {
-	v, ok := opts[key]
-	if !ok || v == nil {
+	v, ok := optionValue(opts, key)
+	if !ok {
 		return nil
 	}
 	switch x := v.(type) {
@@ -212,7 +258,13 @@ func parseSize(s string, fallback int64) int64 {
 
 func optionsForRPC(opts Options) map[string]any {
 	out := make(map[string]any, len(opts))
+	if base, ok := opts[optionBaseKey].(Options); ok {
+		out = optionsForRPC(base)
+	}
 	for k, v := range opts {
+		if k == optionBaseKey {
+			continue
+		}
 		switch x := v.(type) {
 		case []string:
 			out[k] = append([]string(nil), x...)

@@ -39,7 +39,7 @@ func (e *Engine) do(req *http.Request, opts Options) (*http.Response, error) {
 }
 
 func (e *Engine) clientFor(scheme string, opts Options) (*http.Client, error) {
-	if e.customHTTPClient && !hasCustomTransportOptions(opts) {
+	if !hasCustomTransportOptions(opts) {
 		return e.client, nil
 	}
 	cfg, err := buildProxyConfig(scheme, opts)

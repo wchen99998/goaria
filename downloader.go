@@ -1,24 +1,13 @@
 package goaria
 
 import (
-	"compress/gzip"
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/sha512"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
-	"math"
-	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -183,10 +172,6 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	minSplit := optionBytes(opts, "min-split-size", 1<<20)
 	limit := optionBytes(opts, "max-download-limit", 0)
 	limiter := newRateLimiter(limit)
-
-	done := make(chan struct{})
-	go d.trackSpeed(ctx, done)
-	defer close(done)
 
 	if meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= minSplit*2 {
 		chunks := makeChunks(meta.Length, concurrency, minSplit)
@@ -373,6 +358,8 @@ func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Down
 	defer copyBufferPool.Put(bufp)
 	started := time.Now()
 	written := int64(0)
+	speedWindowStart := started
+	speedWindowBytes := int64(0)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -383,9 +370,17 @@ func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Down
 			if nw > 0 {
 				d.addCompleted(int64(nw))
 				written += int64(nw)
+				speedWindowBytes += int64(nw)
 				limiter.wait(int64(nw))
-				if lowestSpeed > 0 && time.Since(started) >= time.Second {
-					avg := written * int64(time.Second) / int64(time.Since(started))
+				elapsed := time.Since(started)
+				windowElapsed := time.Since(speedWindowStart)
+				if windowElapsed >= time.Second {
+					d.setDownloadBPS(speedWindowBytes * int64(time.Second) / int64(windowElapsed))
+					speedWindowStart = time.Now()
+					speedWindowBytes = 0
+				}
+				if lowestSpeed > 0 && elapsed >= time.Second {
+					avg := written * int64(time.Second) / int64(elapsed)
 					if avg <= lowestSpeed {
 						return fmt.Errorf("download speed %d is below lowest-speed-limit %d", avg, lowestSpeed)
 					}
@@ -405,387 +400,4 @@ func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Down
 			return er
 		}
 	}
-}
-
-func (d *Download) setURIUsed(raw string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	for i := range d.uris {
-		if d.uris[i].URI == raw {
-			d.uris[i].Status = URIStatusUsed
-		} else {
-			d.uris[i].Status = URIStatusWaiting
-		}
-	}
-}
-
-func (d *Download) setMetadata(meta remoteMeta, path string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.path = path
-	d.dir = filepath.Dir(path)
-	d.out = filepath.Base(path)
-	d.currentURI = meta.FinalURI
-	d.totalLength = meta.Length
-	if meta.Length > 0 && d.completedLen > meta.Length {
-		d.completedLen = 0
-	}
-	d.pieceLength = 0
-	d.numPieces = 0
-	d.bitfield = ""
-}
-
-func (d *Download) resetProgress(total int64, chunks []chunkRange) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.totalLength = total
-	d.completedLen = 0
-	if len(chunks) > 0 {
-		d.pieceLength = chunks[0].end - chunks[0].start + 1
-		d.numPieces = int64(len(chunks))
-	} else {
-		d.pieceLength = total
-		d.numPieces = 1
-	}
-	d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
-}
-
-func (d *Download) resetSingleProgress(total, completed int64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.totalLength = total
-	d.completedLen = completed
-	if total > 0 {
-		d.pieceLength = total
-		d.numPieces = 1
-		d.bitfield = bitfieldFor(total, completed, total)
-	}
-}
-
-func (d *Download) addCompleted(n int64) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.completedLen += n
-	if d.totalLength > 0 && d.completedLen > d.totalLength {
-		d.completedLen = d.totalLength
-	}
-	if d.pieceLength > 0 {
-		d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
-	}
-}
-
-func (d *Download) setConnections(n int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.connections = n
-}
-
-func (d *Download) trackSpeed(ctx context.Context, done <-chan struct{}) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	last := int64(0)
-	d.mu.RLock()
-	last = d.completedLen
-	d.mu.RUnlock()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-done:
-			return
-		case <-ticker.C:
-			d.mu.Lock()
-			now := d.completedLen
-			d.downloadBPS = now - last
-			last = now
-			d.mu.Unlock()
-		}
-	}
-}
-
-func applyRequestOptions(req *http.Request, opts Options) {
-	ua := optionString(opts, "user-agent")
-	if ua != "" {
-		req.Header.Set("User-Agent", ua)
-	}
-	for _, h := range optionStringList(opts, "header") {
-		name, value, ok := strings.Cut(h, ":")
-		if !ok {
-			continue
-		}
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		req.Header.Add(name, strings.TrimSpace(value))
-	}
-	if ref := optionString(opts, "referer"); ref != "" {
-		if ref == "*" {
-			ref = req.URL.String()
-		}
-		req.Header.Set("Referer", ref)
-	}
-	if optionBool(opts, "http-no-cache") {
-		req.Header.Set("Cache-Control", "no-cache")
-		req.Header.Set("Pragma", "no-cache")
-	}
-	if optionBool(opts, "http-accept-gzip") {
-		req.Header.Set("Accept-Encoding", "gzip")
-	}
-	if !optionBool(opts, "http-auth-challenge") {
-		if user := optionString(opts, "http-user"); user != "" {
-			req.SetBasicAuth(user, optionString(opts, "http-passwd"))
-		} else if req.URL.User != nil {
-			user := req.URL.User.Username()
-			pass, _ := req.URL.User.Password()
-			req.SetBasicAuth(user, pass)
-		}
-	}
-}
-
-func applyConditionalHeaders(req *http.Request, opts Options, path string) {
-	if !optionBool(opts, "conditional-get") {
-		return
-	}
-	st, err := os.Stat(path)
-	if err != nil || st.IsDir() {
-		return
-	}
-	req.Header.Set("If-Modified-Since", st.ModTime().UTC().Format(http.TimeFormat))
-}
-
-func responseReader(resp *http.Response, opts Options) (io.Reader, func(), error) {
-	if optionBool(opts, "http-accept-gzip") && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		zr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, func() {}, err
-		}
-		return zr, func() { _ = zr.Close() }, nil
-	}
-	return resp.Body, func() {}, nil
-}
-
-func metaFromResponse(resp *http.Response, original string) remoteMeta {
-	length := resp.ContentLength
-	filename := filenameFromResponse(resp, original)
-	finalURI := original
-	if resp.Request != nil && resp.Request.URL != nil {
-		finalURI = resp.Request.URL.String()
-	}
-	return remoteMeta{
-		Length:       length,
-		AcceptRange:  strings.Contains(strings.ToLower(resp.Header.Get("Accept-Ranges")), "bytes"),
-		FinalURI:     finalURI,
-		Filename:     filename,
-		LastModified: resp.Header.Get("Last-Modified"),
-	}
-}
-
-func notModifiedMeta(rawURI, path string) remoteMeta {
-	size := int64(0)
-	lastModified := ""
-	if st, err := os.Stat(path); err == nil {
-		size = st.Size()
-		lastModified = st.ModTime().UTC().Format(http.TimeFormat)
-	}
-	return remoteMeta{
-		Length:       size,
-		AcceptRange:  true,
-		FinalURI:     rawURI,
-		Filename:     filepath.Base(path),
-		LastModified: lastModified,
-		NotModified:  true,
-	}
-}
-
-func filenameFromResponse(resp *http.Response, original string) string {
-	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-		if _, params, err := mime.ParseMediaType(cd); err == nil {
-			if name := params["filename"]; name != "" {
-				return filepath.Base(name)
-			}
-		}
-	}
-	if resp.Request != nil && resp.Request.URL != nil {
-		if name := filepath.Base(resp.Request.URL.Path); name != "." && name != "/" && name != "" {
-			return name
-		}
-	}
-	return filenameFromURI(original)
-}
-
-func parseContentRangeTotal(s string) int64 {
-	if s == "" {
-		return -1
-	}
-	_, after, ok := strings.Cut(s, "/")
-	if !ok || after == "*" {
-		return -1
-	}
-	n, err := strconv.ParseInt(after, 10, 64)
-	if err != nil || n < 0 {
-		return -1
-	}
-	return n
-}
-
-func resolveOutputPath(dir, out, filename, rawURI string) string {
-	if dir == "" {
-		dir = "."
-	}
-	if out == "" {
-		out = filename
-	}
-	if out == "" {
-		out = filenameFromURI(rawURI)
-	}
-	if filepath.IsAbs(out) {
-		return filepath.Clean(out)
-	}
-	return filepath.Join(dir, filepath.Clean(out))
-}
-
-func makeChunks(total int64, concurrency int, minSplit int64) []chunkRange {
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	if minSplit <= 0 {
-		minSplit = 1 << 20
-	}
-	maxChunks := int(math.Ceil(float64(total) / float64(minSplit)))
-	if maxChunks < 1 {
-		maxChunks = 1
-	}
-	count := minInt(concurrency, maxChunks)
-	chunkSize := int64(math.Ceil(float64(total) / float64(count)))
-	chunks := make([]chunkRange, 0, count)
-	for start := int64(0); start < total; start += chunkSize {
-		end := start + chunkSize - 1
-		if end >= total {
-			end = total - 1
-		}
-		chunks = append(chunks, chunkRange{start: start, end: end})
-	}
-	return chunks
-}
-
-func bitfieldFor(total, completed, pieceLength int64) string {
-	if total <= 0 || pieceLength <= 0 {
-		return ""
-	}
-	pieces := int(math.Ceil(float64(total) / float64(pieceLength)))
-	if pieces <= 0 {
-		return ""
-	}
-	bytesLen := (pieces + 7) / 8
-	bits := make([]byte, bytesLen)
-	completePieces := int(completed / pieceLength)
-	if completed >= total {
-		completePieces = pieces
-	}
-	for i := 0; i < completePieces; i++ {
-		byteIndex := i / 8
-		bit := uint(7 - (i % 8))
-		bits[byteIndex] |= 1 << bit
-	}
-	return fmt.Sprintf("%x", bits)
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func isRetryableDownloadError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var status *httpStatusError
-	if errors.As(err, &status) {
-		switch status.StatusCode {
-		case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
-			http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			return true
-		default:
-			return false
-		}
-	}
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrShortWrite) {
-		return true
-	}
-	return true
-}
-
-func isFileNotFoundError(err error) bool {
-	var status *httpStatusError
-	return errors.As(err, &status) && status.StatusCode == http.StatusNotFound
-}
-
-func sleepContext(ctx context.Context, d time.Duration) error {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func applyRemoteTime(path string, meta remoteMeta, opts Options) error {
-	if !optionBool(opts, "remote-time") || meta.LastModified == "" {
-		return nil
-	}
-	t, err := http.ParseTime(meta.LastModified)
-	if err != nil {
-		return nil
-	}
-	return os.Chtimes(path, t, t)
-}
-
-func verifyChecksum(path string, opts Options) error {
-	spec := optionString(opts, "checksum")
-	if spec == "" {
-		return nil
-	}
-	algo, expected, ok := strings.Cut(spec, "=")
-	if !ok {
-		return fmt.Errorf("invalid checksum format")
-	}
-	var h hash.Hash
-	switch strings.ToLower(strings.ReplaceAll(algo, "-", "")) {
-	case "md5":
-		h = md5.New()
-	case "sha1":
-		h = sha1.New()
-	case "sha224":
-		h = sha256.New224()
-	case "sha256":
-		h = sha256.New()
-	case "sha384":
-		h = sha512.New384()
-	case "sha512":
-		h = sha512.New()
-	default:
-		return fmt.Errorf("unsupported checksum algorithm %q", algo)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	got := hex.EncodeToString(h.Sum(nil))
-	expected = strings.ToLower(strings.TrimSpace(expected))
-	if got != expected {
-		return fmt.Errorf("checksum mismatch: got %s want %s", got, expected)
-	}
-	return nil
 }

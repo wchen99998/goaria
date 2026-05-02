@@ -203,7 +203,8 @@ func parseSize(s string, fallback int64) int64 {
 		s = s[:len(s)-1]
 	}
 	n, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	if err != nil || n < 0 {
+	maxInt64PlusOne := float64(uint64(1) << 63)
+	if err != nil || n < 0 || math.IsNaN(n) || math.IsInf(n, 0) || n >= maxInt64PlusOne/float64(mul) {
 		return fallback
 	}
 	return int64(n * float64(mul))

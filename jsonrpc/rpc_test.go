@@ -1,4 +1,4 @@
-package goaria
+package jsonrpc
 
 import (
 	"bytes"
@@ -12,15 +12,17 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"goaria"
 )
 
 func TestRPCMethodSurfaceAndToken(t *testing.T) {
-	engine, err := NewEngine(Config{Dir: t.TempDir(), RPCSecret: "secret"})
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer engine.Close(context.Background())
-	rpc := NewRPCHandler(engine, "secret")
+	rpc := NewHandler(engine, "secret")
 
 	resp := invokeRPC(t, rpc, `{"jsonrpc":"2.0","id":"m","method":"system.listMethods"}`)
 	methods := stringSet(resp.Result)
@@ -48,12 +50,12 @@ func TestRPCPostGetBatchAndMulticall(t *testing.T) {
 	}))
 	defer src.Close()
 
-	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer engine.Close(context.Background())
-	server := httptest.NewServer(NewServer(engine, ServerConfig{}).Handler())
+	server := httptest.NewServer(NewServer(engine, Config{}).Handler())
 	defer server.Close()
 
 	postBody := map[string]any{
@@ -80,7 +82,7 @@ func TestRPCPostGetBatchAndMulticall(t *testing.T) {
 	if err := json.Unmarshal(raw, &gid); err != nil {
 		t.Fatal(err)
 	}
-	waitForStatus(t, engine, gid, StatusComplete)
+	waitForStatus(t, engine, gid, goaria.StatusComplete)
 
 	params := base64.StdEncoding.EncodeToString([]byte(`["` + gid + `",["gid","status"]]`))
 	httpResp, err = http.Get(server.URL + "/jsonrpc?method=aria2.tellStatus&id=get&params=" + params)
@@ -121,13 +123,19 @@ func TestRPCPostGetBatchAndMulticall(t *testing.T) {
 }
 
 func TestWebSocketJSONRPCAndNotification(t *testing.T) {
-	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	data := []byte("hello websocket")
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "ws.txt", time.Now(), bytes.NewReader(data))
+	}))
+	defer src.Close()
+
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer engine.Close(context.Background())
 
-	server := httptest.NewServer(NewServer(engine, ServerConfig{}).Handler())
+	server := httptest.NewServer(NewServer(engine, Config{}).Handler())
 	defer server.Close()
 	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/jsonrpc"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
@@ -147,14 +155,19 @@ func TestWebSocketJSONRPCAndNotification(t *testing.T) {
 		t.Fatalf("unexpected websocket response: %#v", response)
 	}
 
-	engine.notify("aria2.onDownloadStart", "0123456789abcdef")
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-	var notification map[string]any
-	if err := conn.ReadJSON(&notification); err != nil {
+
+	if _, err := engine.AddURI([]string{src.URL + "/ws.txt"}, goaria.Options{"out": "ws.txt"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if notification["method"] != "aria2.onDownloadStart" {
-		t.Fatalf("unexpected notification: %#v", notification)
+	for {
+		var notification map[string]any
+		if err := conn.ReadJSON(&notification); err != nil {
+			t.Fatal(err)
+		}
+		if notification["method"] == "aria2.onDownloadStart" || notification["method"] == "aria2.onDownloadComplete" {
+			return
+		}
 	}
 }
 
@@ -183,4 +196,23 @@ func stringSet(v any) map[string]bool {
 		}
 	}
 	return out
+}
+
+func waitForStatus(t testing.TB, engine *goaria.Engine, gid string, want goaria.Status) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status, err := engine.TellStatus(gid, []string{"status", "errorMessage"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status["status"] == string(want) {
+			return
+		}
+		if status["status"] == string(goaria.StatusError) {
+			t.Fatalf("download errored: %v", status["errorMessage"])
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", want)
 }

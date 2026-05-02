@@ -1,6 +1,15 @@
-package goaria
+package jsonrpc
 
 import "encoding/json"
+
+var notificationMethods = []string{
+	"aria2.onDownloadStart",
+	"aria2.onDownloadPause",
+	"aria2.onDownloadStop",
+	"aria2.onDownloadComplete",
+	"aria2.onDownloadError",
+	"aria2.onBtDownloadComplete",
+}
 
 func (h *RPCHandler) invoke(method string, params []json.RawMessage) (any, error) {
 	switch method {

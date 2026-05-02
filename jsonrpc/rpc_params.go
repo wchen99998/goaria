@@ -1,4 +1,4 @@
-package goaria
+package jsonrpc
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+
+	"goaria"
 )
 
 func stringParam(params []json.RawMessage, i int) (string, error) {
@@ -67,18 +69,18 @@ func optionalIntParam(params []json.RawMessage, i int) (*int, error) {
 	return &n, nil
 }
 
-func optionsParam(params []json.RawMessage, i int, required bool) (Options, error) {
+func optionsParam(params []json.RawMessage, i int, required bool) (goaria.Options, error) {
 	if i >= len(params) {
 		if required {
 			return nil, callError{code: rpcInvalidParams, msg: "Invalid params"}
 		}
-		return Options{}, nil
+		return goaria.Options{}, nil
 	}
 	var raw map[string]any
 	if err := decodeUseNumber(params[i], &raw); err != nil {
 		return nil, callError{code: rpcInvalidParams, msg: "Invalid params"}
 	}
-	return normalizeOptions(raw), nil
+	return goaria.Options(raw), nil
 }
 
 func decodeUseNumber(data []byte, v any) error {

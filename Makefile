@@ -28,20 +28,20 @@ live-chaos:
 fuzz:
 	go test -run '^$$' -fuzz=FuzzParseContentRangeTotal -fuzztime=15s .
 	go test -run '^$$' -fuzz=FuzzMakeChunks -fuzztime=15s .
-	go test -run '^$$' -fuzz=FuzzParseJSONRPCCall -fuzztime=15s .
+	go test -run '^$$' -fuzz=FuzzParseJSONRPCCall -fuzztime=15s ./jsonrpc
 	go test -run '^$$' -fuzz=FuzzProxyParsingAndBypass -fuzztime=15s .
-	go test -run '^$$' -fuzz=FuzzJSONRPCOverHTTPChunks -fuzztime=15s .
-	go test -run '^$$' -fuzz=FuzzBuildGETPayload -fuzztime=15s .
+	go test -run '^$$' -fuzz=FuzzJSONRPCOverHTTPChunks -fuzztime=15s ./jsonrpc
+	go test -run '^$$' -fuzz=FuzzBuildGETPayload -fuzztime=15s ./jsonrpc
 	go test -run '^$$' -fuzz=FuzzOptionsAndSizes -fuzztime=15s .
 	go test -run '^$$' -fuzz=FuzzPathsAndBitfield -fuzztime=15s .
 
 fuzz-hour:
 	go test -run '^$$' -fuzz=FuzzParseContentRangeTotal -fuzztime=1h .
 	go test -run '^$$' -fuzz=FuzzMakeChunks -fuzztime=1h .
-	go test -run '^$$' -fuzz=FuzzParseJSONRPCCall -fuzztime=1h .
+	go test -run '^$$' -fuzz=FuzzParseJSONRPCCall -fuzztime=1h ./jsonrpc
 	go test -run '^$$' -fuzz=FuzzProxyParsingAndBypass -fuzztime=1h .
-	go test -run '^$$' -fuzz=FuzzJSONRPCOverHTTPChunks -fuzztime=1h .
-	go test -run '^$$' -fuzz=FuzzBuildGETPayload -fuzztime=1h .
+	go test -run '^$$' -fuzz=FuzzJSONRPCOverHTTPChunks -fuzztime=1h ./jsonrpc
+	go test -run '^$$' -fuzz=FuzzBuildGETPayload -fuzztime=1h ./jsonrpc
 	go test -run '^$$' -fuzz=FuzzOptionsAndSizes -fuzztime=1h .
 	go test -run '^$$' -fuzz=FuzzPathsAndBitfield -fuzztime=1h .
 

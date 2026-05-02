@@ -1,4 +1,4 @@
-package goaria
+package jsonrpc
 
 import (
 	"bytes"
@@ -14,11 +14,25 @@ import (
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+
+	"goaria"
 )
 
+const (
+	DefaultAddr           = ":6800"
+	DefaultMaxRequestSize = 2 << 20
+)
+
+type Config struct {
+	Addr           string
+	MaxRequestSize int64
+	Secret         string
+	Logger         *zap.Logger
+}
+
 type Server struct {
-	engine   *Engine
-	rpc      *RPCHandler
+	engine   *goaria.Engine
+	rpc      *Handler
 	addr     string
 	maxBody  int64
 	log      *zap.Logger
@@ -26,24 +40,20 @@ type Server struct {
 	upgrader websocket.Upgrader
 }
 
-func NewServer(engine *Engine, cfg ServerConfig) *Server {
+func NewServer(engine *goaria.Engine, cfg Config) *Server {
 	if cfg.Addr == "" {
-		cfg.Addr = ":6800"
+		cfg.Addr = DefaultAddr
 	}
 	if cfg.MaxRequestSize <= 0 {
-		cfg.MaxRequestSize = engine.cfg.MaxRequestSize
-	}
-	secret := cfg.RPCSecret
-	if secret == "" {
-		secret = engine.cfg.RPCSecret
+		cfg.MaxRequestSize = DefaultMaxRequestSize
 	}
 	log := cfg.Logger
 	if log == nil {
-		log = engine.log
+		log = zap.NewNop()
 	}
 	return &Server{
 		engine:  engine,
-		rpc:     NewRPCHandler(engine, secret),
+		rpc:     NewHandler(engine, cfg.Secret),
 		addr:    cfg.Addr,
 		maxBody: cfg.MaxRequestSize,
 		log:     log,

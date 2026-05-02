@@ -32,18 +32,9 @@ type Config struct {
 	Dir                    string
 	MaxConcurrentDownloads int
 	MaxDownloadResult      int
-	MaxRequestSize         int64
-	RPCSecret              string
 	UserAgent              string
 	HTTPClient             *http.Client
 	Logger                 *zap.Logger
-}
-
-type ServerConfig struct {
-	Addr           string
-	MaxRequestSize int64
-	RPCSecret      string
-	Logger         *zap.Logger
 }
 
 type URIStatus string

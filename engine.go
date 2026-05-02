@@ -94,9 +94,6 @@ func NewEngine(cfg Config) (*Engine, error) {
 	if cfg.MaxDownloadResult <= 0 {
 		cfg.MaxDownloadResult = 1000
 	}
-	if cfg.MaxRequestSize <= 0 {
-		cfg.MaxRequestSize = 2 << 20
-	}
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = "goaria/" + Version
 	}

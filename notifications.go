@@ -2,15 +2,6 @@ package goaria
 
 import "time"
 
-var notificationMethods = []string{
-	"aria2.onDownloadStart",
-	"aria2.onDownloadPause",
-	"aria2.onDownloadStop",
-	"aria2.onDownloadComplete",
-	"aria2.onDownloadError",
-	"aria2.onBtDownloadComplete",
-}
-
 func (e *Engine) Subscribe(buffer int) (<-chan Notification, func()) {
 	if buffer <= 0 {
 		buffer = 32

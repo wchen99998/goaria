@@ -1,4 +1,4 @@
-package goaria
+package jsonrpc
 
 import (
 	"bytes"
@@ -8,15 +8,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"goaria"
 )
 
 func TestJSONRPCPostBodyChunks(t *testing.T) {
-	engine, err := NewEngine(Config{Dir: t.TempDir(), RPCSecret: "chunk-secret"})
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer engine.Close(context.Background())
-	server := httptest.NewServer(NewServer(engine, ServerConfig{RPCSecret: "chunk-secret"}).Handler())
+	server := httptest.NewServer(NewServer(engine, Config{Secret: "chunk-secret"}).Handler())
 	defer server.Close()
 
 	payloads := [][]byte{

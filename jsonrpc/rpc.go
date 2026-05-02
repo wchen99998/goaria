@@ -1,4 +1,4 @@
-package goaria
+package jsonrpc
 
 import (
 	"bytes"
@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"goaria"
 )
 
 const (
@@ -58,9 +60,11 @@ var rpcMethods = []string{
 }
 
 type RPCHandler struct {
-	engine *Engine
+	engine *goaria.Engine
 	secret string
 }
+
+type Handler = RPCHandler
 
 type rpcCall struct {
 	JSONRPC string
@@ -91,8 +95,12 @@ func (e callError) Error() string {
 	return e.msg
 }
 
-func NewRPCHandler(engine *Engine, secret string) *RPCHandler {
+func NewRPCHandler(engine *goaria.Engine, secret string) *RPCHandler {
 	return &RPCHandler{engine: engine, secret: secret}
+}
+
+func NewHandler(engine *goaria.Engine, secret string) *Handler {
+	return NewRPCHandler(engine, secret)
 }
 
 func (h *RPCHandler) HandlePayload(payload []byte) ([]byte, bool) {
@@ -221,10 +229,10 @@ func rpcCode(err error) int {
 	if errors.As(err, &ce) {
 		return ce.code
 	}
-	if errors.Is(err, ErrInvalidParams) {
+	if errors.Is(err, goaria.ErrInvalidParams) {
 		return rpcInvalidParams
 	}
-	if errors.Is(err, ErrUnsupportedMethod) || errors.Is(err, ErrUnsupportedProtocol) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrInvalidGID) {
+	if errors.Is(err, goaria.ErrUnsupportedMethod) || errors.Is(err, goaria.ErrUnsupportedProtocol) || errors.Is(err, goaria.ErrNotFound) || errors.Is(err, goaria.ErrInvalidGID) {
 		return rpcAriaError
 	}
 	return rpcAriaError

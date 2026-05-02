@@ -1,4 +1,4 @@
-package goaria
+package jsonrpc
 
 import (
 	"context"
@@ -8,19 +8,21 @@ import (
 
 	chaff "github.com/ryanolee/go-chaff"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+
+	"goaria"
 )
 
 func TestJSONRPCSchemaWithGoChaff(t *testing.T) {
-	generator, err := chaff.ParseSchemaFileWithDefaults("schemas/aria2-jsonrpc.schema.json")
+	generator, err := chaff.ParseSchemaFileWithDefaults("../schemas/aria2-jsonrpc.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := NewEngine(Config{Dir: t.TempDir(), RPCSecret: "schema-secret"})
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer engine.Close(context.Background())
-	rpc := NewRPCHandler(engine, "schema-secret")
+	rpc := NewHandler(engine, "schema-secret")
 
 	opts := &chaff.GeneratorOptions{
 		DefaultStringMaxLength:     64,
@@ -46,14 +48,14 @@ func TestJSONRPCSchemaWithGoChaff(t *testing.T) {
 }
 
 func TestJSONRPCSchemaAcceptsKnownRequests(t *testing.T) {
-	payload, err := os.ReadFile("schemas/aria2-jsonrpc.schema.json")
+	payload, err := os.ReadFile("../schemas/aria2-jsonrpc.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !json.Valid(payload) {
 		t.Fatal("schema is not valid JSON")
 	}
-	compiled, err := jsonschema.NewCompiler().Compile("schemas/aria2-jsonrpc.schema.json")
+	compiled, err := jsonschema.NewCompiler().Compile("../schemas/aria2-jsonrpc.schema.json")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"goaria"
+	"goaria/jsonrpc"
 )
 
 func main() {
@@ -47,9 +48,8 @@ func runDaemon(args []string) error {
 	defer log.Sync()
 
 	engine, err := goaria.NewEngine(goaria.Config{
-		Dir:       *dir,
-		RPCSecret: *secret,
-		Logger:    log,
+		Dir:    *dir,
+		Logger: log,
 	})
 	if err != nil {
 		return err
@@ -58,7 +58,7 @@ func runDaemon(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	server := goaria.NewServer(engine, goaria.ServerConfig{Addr: *addr, RPCSecret: *secret, Logger: log})
+	server := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: *addr, Secret: *secret, Logger: log})
 	return server.ListenAndServe(ctx)
 }
 

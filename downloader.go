@@ -63,6 +63,8 @@ var smallCopyBufferPool = sync.Pool{
 	},
 }
 
+const metadataProbeRangeEnd = 1023
+
 type remoteMeta struct {
 	Length       int64
 	AcceptRange  bool
@@ -341,6 +343,8 @@ func transportOptionsForSegmented(opts Options) Options {
 }
 
 func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditionalPath string) (remoteMeta, error) {
+	var headMeta remoteMeta
+	headMetaOK := false
 	if optionBoolDefault(opts, "use-head", true) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURI, nil)
 		if err != nil {
@@ -355,9 +359,13 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 				return notModifiedMeta(rawURI, conditionalPath), nil
 			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				return metaFromResponse(resp, rawURI), nil
-			}
-			if resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusNotImplemented && resp.StatusCode != http.StatusForbidden {
+				meta := metaFromResponse(resp, rawURI)
+				if resp.ContentLength >= 0 {
+					return meta, nil
+				}
+				headMeta = meta
+				headMetaOK = true
+			} else if resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusNotImplemented && resp.StatusCode != http.StatusForbidden {
 				return remoteMeta{}, &httpStatusError{Method: http.MethodHead, URL: rawURI, StatusCode: resp.StatusCode, Status: resp.Status}
 			}
 		}
@@ -367,11 +375,14 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 	if err != nil {
 		return remoteMeta{}, err
 	}
-	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", metadataProbeRangeEnd))
 	applyRequestOptions(req, opts)
 	applyConditionalHeaders(req, opts, conditionalPath)
 	resp, err := e.do(req, opts)
 	if err != nil {
+		if headMetaOK {
+			return headMeta, nil
+		}
 		return remoteMeta{}, err
 	}
 	defer resp.Body.Close()
@@ -379,6 +390,9 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 		return notModifiedMeta(rawURI, conditionalPath), nil
 	}
 	if resp.StatusCode >= 400 {
+		if headMetaOK {
+			return headMeta, nil
+		}
 		return remoteMeta{}, &httpStatusError{Method: http.MethodGet, URL: rawURI, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	meta := metaFromResponse(resp, rawURI)
@@ -386,6 +400,8 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 		meta.AcceptRange = true
 		if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
 			meta.Length = total
+		} else {
+			meta.Length = 0
 		}
 	}
 	return meta, nil

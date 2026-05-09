@@ -17,12 +17,13 @@ func (d *Download) setURIUsed(raw string) {
 func (d *Download) setMetadata(meta remoteMeta, path string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	total := nonNegativeLength(meta.Length)
 	d.path = path
 	d.dir = filepath.Dir(path)
 	d.out = filepath.Base(path)
 	d.currentURI = meta.FinalURI
-	d.totalLength = meta.Length
-	if meta.Length > 0 && d.completedLen > meta.Length {
+	d.totalLength = total
+	if total > 0 && d.completedLen > total {
 		d.completedLen = 0
 	}
 	d.pieceLength = 0
@@ -34,6 +35,7 @@ func (d *Download) setMetadata(meta remoteMeta, path string) {
 func (d *Download) resetProgress(total int64, chunks []chunkRange) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	total = nonNegativeLength(total)
 	d.totalLength = total
 	d.completedLen = 0
 	if len(chunks) > 0 {
@@ -50,6 +52,8 @@ func (d *Download) resetProgress(total int64, chunks []chunkRange) {
 func (d *Download) resetSingleProgress(total, completed int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	total = nonNegativeLength(total)
+	completed = nonNegativeLength(completed)
 	d.totalLength = total
 	d.completedLen = completed
 	if total > 0 {

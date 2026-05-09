@@ -34,6 +34,13 @@ func parseContentRangeTotal(s string) int64 {
 	return n
 }
 
+func nonNegativeLength(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 func resolveOutputPath(dir, out, filename, rawURI string) string {
 	if dir == "" {
 		dir = "."

@@ -73,7 +73,7 @@ func responseReader(resp *http.Response, opts Options) (io.Reader, func(), error
 }
 
 func metaFromResponse(resp *http.Response, original string) remoteMeta {
-	length := resp.ContentLength
+	length := nonNegativeLength(resp.ContentLength)
 	filename := filenameFromResponse(resp, original)
 	finalURI := original
 	if resp.Request != nil && resp.Request.URL != nil {

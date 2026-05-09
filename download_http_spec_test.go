@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -256,6 +257,126 @@ func TestHTTPAcceptGzipDecompressesBody(t *testing.T) {
 	}
 	waitForStatus(t, engine, gid, StatusComplete)
 	assertFileEquals(t, filepath.Join(dir, "gzip.txt"), data)
+}
+
+func TestHTTPProbeFallsBackToRangeWhenHeadLengthIsUnknown(t *testing.T) {
+	data := bytes.Repeat([]byte("range-data"), 512)
+	var sawRange atomic.Bool
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		if got := r.Header.Get("Range"); got != "bytes=0-1023" {
+			http.Error(w, "unexpected range "+got, http.StatusBadRequest)
+			return
+		}
+		sawRange.Store(true)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-1023/%d", len(data)))
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[:1024])
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/range.bin"}, Options{
+		"out":     "range.bin",
+		"dry-run": "true",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	waitForStatus(t, engine, gid, StatusComplete)
+	if !sawRange.Load() {
+		t.Fatal("range fallback was not used")
+	}
+	status, err := engine.TellStatus(gid, []string{"totalLength", "files"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strconv.Itoa(len(data))
+	if status["totalLength"] != want {
+		t.Fatalf("totalLength = %v, want %s", status["totalLength"], want)
+	}
+	files := status["files"].([]FileInfo)
+	if files[0].Length != want {
+		t.Fatalf("file length = %v, want %s", files[0].Length, want)
+	}
+}
+
+func TestUnknownLengthHTTPDownloadPublishesObservedSize(t *testing.T) {
+	data := bytes.Repeat([]byte("chunked-data"), 128*1024)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		startedOnce.Do(func() { close(started) })
+		<-release
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/chunked.bin"}, Options{"out": "chunked.bin"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for chunked response to start")
+	}
+	status, err := engine.TellStatus(gid, []string{"status", "totalLength", "files"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != string(StatusActive) {
+		t.Fatalf("status = %v, want active", status["status"])
+	}
+	if status["totalLength"] != "0" {
+		t.Fatalf("active totalLength = %v, want 0 for unknown length", status["totalLength"])
+	}
+	files := status["files"].([]FileInfo)
+	if files[0].Length != "0" {
+		t.Fatalf("active file length = %v, want 0 for unknown length", files[0].Length)
+	}
+
+	close(release)
+	waitForStatus(t, engine, gid, StatusComplete)
+	status, err = engine.TellStatus(gid, []string{"totalLength", "completedLength", "files"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strconv.Itoa(len(data))
+	if status["totalLength"] != want || status["completedLength"] != want {
+		t.Fatalf("final lengths = total %v completed %v, want %s", status["totalLength"], status["completedLength"], want)
+	}
+	files = status["files"].([]FileInfo)
+	if files[0].Length != want || files[0].CompletedLength != want {
+		t.Fatalf("final file lengths = length %v completed %v, want %s", files[0].Length, files[0].CompletedLength, want)
+	}
+	assertFileEquals(t, filepath.Join(dir, "chunked.bin"), data)
 }
 
 func TestLowestSpeedLimitFailsSlowTransfer(t *testing.T) {

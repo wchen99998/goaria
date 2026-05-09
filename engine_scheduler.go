@@ -78,6 +78,8 @@ func (e *Engine) finishDownload(d *Download, err error) {
 			d.status = StatusComplete
 			if d.totalLength > 0 {
 				d.completedLen = d.totalLength
+			} else if d.completedLen > 0 {
+				d.totalLength = d.completedLen
 			}
 			notification = "aria2.onDownloadComplete"
 		} else if e.ctx.Err() != nil {

@@ -55,6 +55,33 @@ func TestSegmentedHTTPDownloadCompletes(t *testing.T) {
 	}
 }
 
+func TestDownloadSpeedTrackerAggregatesConcurrentWorkers(t *testing.T) {
+	d := &Download{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tracker := startDownloadSpeedTrackerWithInterval(ctx, d, 100*time.Millisecond)
+	defer tracker.stopAndWait()
+
+	for i := 0; i < 4; i++ {
+		tracker.add(256 * 1024)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		d.mu.RLock()
+		speed := d.downloadBPS
+		d.mu.RUnlock()
+		if speed > 0 {
+			if speed < 5*1024*1024 {
+				t.Fatalf("downloadBPS = %d, expected aggregate worker speed", speed)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for aggregate download speed")
+}
+
 func TestQueuePauseUnpauseAndChangePosition(t *testing.T) {
 	engine, err := NewEngine(Config{Dir: t.TempDir(), MaxConcurrentDownloads: 1})
 	if err != nil {

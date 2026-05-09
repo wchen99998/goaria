@@ -20,6 +20,8 @@ Download directly from the CLI:
 go run ./cmd/goaria -dir ./downloads -split 8 -max-connection-per-server 8 https://example.com/file.bin
 ```
 
+For CDN compatibility testing, the direct CLI also accepts `-http-version` (`auto`, `1.1`, `2`, or `3`) and `-user-agent`.
+
 The JSON-RPC endpoint is `/jsonrpc`, matching aria2. HTTP POST, HTTP GET with base64 `params`, JSONP, batch requests, `system.multicall`, and JSON-RPC over WebSocket are implemented.
 
 ## Library

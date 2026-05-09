@@ -78,6 +78,37 @@ func TestHTTP2Download(t *testing.T) {
 	}
 }
 
+func TestAutoSegmentedDownloadPrefersHTTP1AgainstHTTP2CapableServer(t *testing.T) {
+	data := bytes.Repeat([]byte("auto-h1-"), 4096)
+	seen := protocolRecorder{}
+	src := newTLSServer(t, true, protocolHandler(data, &seen))
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/auto-h1.bin"}, Options{
+		"out":                       "auto-h1.bin",
+		"check-certificate":         "false",
+		"split":                     "2",
+		"max-connection-per-server": "2",
+		"min-split-size":            "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "auto-h1.bin"), data)
+	if seen.saw("HTTP/2.0") {
+		t.Fatalf("auto segmented download used HTTP/2: %#v", seen.snapshot())
+	}
+	if !seen.sawPrefix("HTTP/1.") {
+		t.Fatalf("expected HTTP/1.x for auto segmented download, saw %#v", seen.snapshot())
+	}
+}
+
 func TestHTTP3Download(t *testing.T) {
 	data := bytes.Repeat([]byte("http3-"), 4096)
 	seen := protocolRecorder{}

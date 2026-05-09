@@ -66,8 +66,10 @@ func runDownload(args []string) error {
 	fs := flag.NewFlagSet("goaria", flag.ExitOnError)
 	dir := fs.String("dir", ".", "download directory")
 	out := fs.String("out", "", "output filename for a single URL")
-	split := fs.Int("split", 5, "number of pieces per download")
-	connections := fs.Int("max-connection-per-server", 5, "maximum HTTP connections per server")
+	split := fs.Int("split", 4, "number of pieces per download")
+	connections := fs.Int("max-connection-per-server", 4, "maximum HTTP connections per server")
+	httpVersion := fs.String("http-version", "auto", "HTTP version: auto, 1.1, 2, or 3")
+	userAgent := fs.String("user-agent", "", "HTTP User-Agent")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -81,7 +83,7 @@ func runDownload(args []string) error {
 		return err
 	}
 	defer log.Sync()
-	engine, err := goaria.NewEngine(goaria.Config{Dir: *dir, Logger: log})
+	engine, err := goaria.NewEngine(goaria.Config{Dir: *dir, UserAgent: *userAgent, Logger: log})
 	if err != nil {
 		return err
 	}
@@ -95,6 +97,7 @@ func runDownload(args []string) error {
 		opts := goaria.Options{
 			"split":                     fmt.Sprint(*split),
 			"max-connection-per-server": fmt.Sprint(*connections),
+			"http-version":              *httpVersion,
 		}
 		if *out != "" && fs.NArg() == 1 && i == 0 {
 			opts["out"] = *out

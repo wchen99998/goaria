@@ -23,8 +23,8 @@ func defaultOptions(dir string, maxConcurrent, maxResult int) Options {
 	}
 	return Options{
 		"dir":                        dir,
-		"split":                      "5",
-		"max-connection-per-server":  "5",
+		"split":                      "4",
+		"max-connection-per-server":  "4",
 		"min-split-size":             "1M",
 		"max-concurrent-downloads":   strconv.Itoa(maxConcurrent),
 		"max-download-result":        strconv.Itoa(maxResult),

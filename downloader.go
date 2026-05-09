@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,6 +24,18 @@ type httpStatusError struct {
 
 func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("%s %s: %s", e.Method, e.URL, e.Status)
+}
+
+type rangeBodyError struct {
+	err error
+}
+
+func (e *rangeBodyError) Error() string {
+	return e.err.Error()
+}
+
+func (e *rangeBodyError) Unwrap() error {
+	return e.err
 }
 
 var copyBufferPool = sync.Pool{
@@ -62,6 +75,81 @@ type remoteMeta struct {
 type chunkRange struct {
 	start int64
 	end   int64
+}
+
+type downloadSpeedTracker struct {
+	d     *Download
+	bytes atomic.Int64
+	stop  chan struct{}
+	done  chan struct{}
+	once  sync.Once
+}
+
+func startDownloadSpeedTracker(ctx context.Context, d *Download) *downloadSpeedTracker {
+	return startDownloadSpeedTrackerWithInterval(ctx, d, time.Second)
+}
+
+func startDownloadSpeedTrackerWithInterval(ctx context.Context, d *Download, interval time.Duration) *downloadSpeedTracker {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	t := &downloadSpeedTracker{
+		d:    d,
+		stop: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	go t.run(ctx, interval)
+	return t
+}
+
+func (t *downloadSpeedTracker) add(n int64) {
+	if t != nil && n > 0 {
+		t.bytes.Add(n)
+	}
+}
+
+func (t *downloadSpeedTracker) stopAndWait() {
+	if t == nil {
+		return
+	}
+	t.once.Do(func() {
+		close(t.stop)
+		<-t.done
+	})
+}
+
+func (t *downloadSpeedTracker) run(ctx context.Context, interval time.Duration) {
+	defer close(t.done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	lastBytes := int64(0)
+	lastAt := time.Now()
+	update := func(now time.Time) {
+		current := t.bytes.Load()
+		elapsed := now.Sub(lastAt)
+		if elapsed <= 0 {
+			return
+		}
+		delta := current - lastBytes
+		if delta < 0 {
+			delta = 0
+		}
+		t.d.setDownloadBPS(delta * int64(time.Second) / int64(elapsed))
+		lastBytes = current
+		lastAt = now
+	}
+	for {
+		select {
+		case now := <-ticker.C:
+			update(now)
+		case <-ctx.Done():
+			update(time.Now())
+			return
+		case <-t.stop:
+			update(time.Now())
+			return
+		}
+	}
 }
 
 type rateLimiter struct {
@@ -195,7 +283,11 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 
 	provisionalName := filenameFromURI(rawURI)
 	provisionalPath := resolveOutputPath(dirOpt, outOpt, provisionalName, rawURI)
-	meta, err := e.probe(ctx, rawURI, opts, provisionalPath)
+	probeOpts := opts
+	if concurrency > 1 {
+		probeOpts = transportOptionsForSegmented(opts)
+	}
+	meta, err := e.probe(ctx, rawURI, probeOpts, provisionalPath)
 	if err != nil {
 		return err
 	}
@@ -217,6 +309,7 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 		segmentedMin = 8 << 20
 	}
 	if meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= segmentedMin {
+		opts = transportOptionsForSegmented(opts)
 		chunks := makeChunks(meta.Length, concurrency, minSplit)
 		err = e.downloadSegmented(ctx, d, meta, outPath, opts, chunks, limiter)
 	} else {
@@ -236,6 +329,15 @@ func canUseSingleGETProbe(opts Options, concurrency int) bool {
 		return false
 	}
 	return optionString(opts, "out") != "" || !optionBool(opts, "continue")
+}
+
+func transportOptionsForSegmented(opts Options) Options {
+	if normalizeHTTPVersion(optionString(opts, "http-version")) != "auto" {
+		return opts
+	}
+	out := cloneOptions(opts)
+	out["http-version"] = "1.1"
+	return out
 }
 
 func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditionalPath string) (remoteMeta, error) {
@@ -302,15 +404,22 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 		return err
 	}
 	d.resetProgress(meta.Length, chunks)
+	tracker := startDownloadSpeedTracker(ctx, d)
+	defer tracker.stopAndWait()
 
 	errCh := make(chan error, len(chunks))
 	var wg sync.WaitGroup
+	maxTries := optionInt(opts, "max-tries", 5)
+	if maxTries < 0 {
+		maxTries = 1
+	}
+	retryWait := time.Duration(optionInt(opts, "retry-wait", 0)) * time.Second
 	d.setConnections(len(chunks))
 	for _, ch := range chunks {
 		wg.Add(1)
 		go func(r chunkRange) {
 			defer wg.Done()
-			errCh <- e.downloadRange(ctx, d, meta.FinalURI, path, opts, r, limiter)
+			errCh <- e.downloadRangeWithRetries(ctx, d, meta.FinalURI, path, opts, r, limiter, tracker, maxTries, retryWait)
 		}(ch)
 	}
 	wg.Wait()
@@ -324,7 +433,38 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 	return nil
 }
 
-func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI, path string, opts Options, r chunkRange, limiter *rateLimiter) error {
+func (e *Engine) downloadRangeWithRetries(ctx context.Context, d *Download, rawURI, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker, maxTries int, retryWait time.Duration) error {
+	var lastErr error
+	for attempt := 0; maxTries == 0 || attempt < maxTries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := e.downloadRange(ctx, d, rawURI, path, opts, r, limiter, tracker)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isRetryableRangeSetupError(err) {
+			return err
+		}
+		if retryWait > 0 {
+			if err := sleepContext(ctx, retryWait); err != nil {
+				return err
+			}
+		}
+	}
+	return lastErr
+}
+
+func isRetryableRangeSetupError(err error) bool {
+	var bodyErr *rangeBodyError
+	if errors.As(err, &bodyErr) {
+		return false
+	}
+	return isRetryableDownloadError(err)
+}
+
+func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURI, nil)
 	if err != nil {
 		return err
@@ -352,7 +492,10 @@ func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI, path st
 	if _, err := file.Seek(r.start, io.SeekStart); err != nil {
 		return err
 	}
-	return copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
+	if err := copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker); err != nil {
+		return &rangeBodyError{err: err}
+	}
+	return nil
 }
 
 func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, limiter *rateLimiter) error {
@@ -407,7 +550,9 @@ func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMet
 		return err
 	}
 	defer closeBody()
-	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
+	tracker := startDownloadSpeedTracker(ctx, d)
+	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker)
+	tracker.stopAndWait()
 	d.setConnections(0)
 	return err
 }
@@ -525,7 +670,9 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 		return remoteMeta{}, "", err
 	}
 	defer closeBody()
-	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength)
+	tracker := startDownloadSpeedTracker(ctx, d)
+	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker)
+	tracker.stopAndWait()
 	d.setConnections(0)
 	if err != nil {
 		return remoteMeta{}, "", err
@@ -537,33 +684,31 @@ func canCreateSingleDestinationBeforeGET(opts Options, out string) bool {
 	return out != "" && optionBool(opts, "continue") && !optionBool(opts, "conditional-get")
 }
 
-func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, contentLength int64) error {
+func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, contentLength int64, tracker *downloadSpeedTracker) error {
 	if contentLength > 0 && contentLength <= smallCopyBufferSize {
 		bufp := smallCopyBufferPool.Get().(*[]byte)
 		buf := *bufp
 		defer smallCopyBufferPool.Put(bufp)
-		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
+		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf, tracker)
 	}
 	if contentLength >= 512<<10 {
 		bufp := largeCopyBufferPool.Get().(*[]byte)
 		buf := *bufp
 		defer largeCopyBufferPool.Put(bufp)
-		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
+		return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf, tracker)
 	}
 	bufp := copyBufferPool.Get().(*[]byte)
 	buf := *bufp
 	defer copyBufferPool.Put(bufp)
-	return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf)
+	return copyWithProgressBuffer(ctx, dst, src, d, limiter, lowestSpeed, buf, tracker)
 }
 
-func copyWithProgressBuffer(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, buf []byte) error {
+func copyWithProgressBuffer(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, buf []byte, tracker *downloadSpeedTracker) error {
 	const progressFlushBytes = 1 * 1024 * 1024
 
 	started := time.Now()
 	written := int64(0)
 	pendingProgress := int64(0)
-	speedWindowStart := started
-	speedWindowBytes := int64(0)
 	flushProgress := func() {
 		if pendingProgress > 0 {
 			d.addCompleted(pendingProgress)
@@ -571,11 +716,6 @@ func copyWithProgressBuffer(ctx context.Context, dst io.Writer, src io.Reader, d
 		}
 	}
 	checkSpeed := func(now time.Time) error {
-		if windowElapsed := now.Sub(speedWindowStart); windowElapsed >= time.Second {
-			d.setDownloadBPS(speedWindowBytes * int64(time.Second) / int64(windowElapsed))
-			speedWindowStart = now
-			speedWindowBytes = 0
-		}
 		if lowestSpeed > 0 {
 			if elapsed := now.Sub(started); elapsed >= time.Second {
 				avg := written * int64(time.Second) / int64(elapsed)
@@ -598,7 +738,7 @@ func copyWithProgressBuffer(ctx context.Context, dst io.Writer, src io.Reader, d
 				n := int64(nw)
 				pendingProgress += n
 				written += n
-				speedWindowBytes += n
+				tracker.add(n)
 				limiter.wait(n)
 				if pendingProgress >= progressFlushBytes || lowestSpeed > 0 {
 					flushProgress()

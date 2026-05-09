@@ -36,6 +36,8 @@ func runDaemon(args []string) error {
 	fs := flag.NewFlagSet("goaria daemon", flag.ExitOnError)
 	addr := fs.String("listen", ":6800", "RPC listen address")
 	dir := fs.String("dir", ".", "download directory")
+	inputFile := fs.String("input-file", "", "aria2-style session/input file to load at startup")
+	saveSession := fs.String("save-session", "", "aria2-style session file to save automatically")
 	secret := fs.String("rpc-secret", "", "aria2 RPC secret token")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
 	if err := fs.Parse(args); err != nil {
@@ -48,8 +50,10 @@ func runDaemon(args []string) error {
 	defer log.Sync()
 
 	engine, err := goaria.NewEngine(goaria.Config{
-		Dir:    *dir,
-		Logger: log,
+		Dir:         *dir,
+		InputFile:   *inputFile,
+		SaveSession: *saveSession,
+		Logger:      log,
 	})
 	if err != nil {
 		return err

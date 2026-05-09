@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -33,6 +32,7 @@ type Engine struct {
 	stoppedTotal int
 	global       Options
 	sessionID    string
+	sessionMu    sync.Mutex
 
 	wake        chan struct{}
 	shutdownReq chan bool
@@ -139,8 +139,18 @@ func NewEngine(cfg Config) (*Engine, error) {
 		subscribers:      make(map[chan Notification]struct{}),
 	}
 	e.global["user-agent"] = cfg.UserAgent
+	if cfg.SaveSession != "" {
+		e.global["save-session"] = cfg.SaveSession
+	}
+	if cfg.InputFile != "" {
+		if err := e.loadSession(cfg.InputFile); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
 	e.wg.Add(1)
 	go e.scheduler()
+	e.signal()
 	return e, nil
 }
 
@@ -156,8 +166,9 @@ func (e *Engine) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-done:
+		saveErr := e.saveSessionIfConfigured()
 		e.closeTransports()
-		return nil
+		return saveErr
 	}
 }
 
@@ -186,8 +197,8 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 	}
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if err := e.ctx.Err(); err != nil {
+		e.mu.Unlock()
 		return "", ErrShutdown
 	}
 	merged := layerOptions(e.global, opts)
@@ -195,9 +206,11 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 	if gid == "" {
 		gid = randomHex(8)
 	} else if !validGID(gid) {
+		e.mu.Unlock()
 		return "", ErrInvalidGID
 	}
 	if _, exists := e.downloads[gid]; exists {
+		e.mu.Unlock()
 		return "", fmt.Errorf("gid already exists")
 	}
 	d := newDownload(gid, uris, merged)
@@ -210,7 +223,9 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 	if ce := e.log.Check(zap.InfoLevel, "download added"); ce != nil {
 		ce.Write(zap.String("gid", gid), zap.Strings("uris", uris))
 	}
+	e.mu.Unlock()
 	e.signal()
+	e.saveSessionBestEffort()
 	return gid, nil
 }
 
@@ -254,21 +269,25 @@ func (e *Engine) ForcePauseAll() (string, error) {
 
 func (e *Engine) Unpause(gid string) (string, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	d, err := e.findDownloadLocked(gid)
 	if err != nil {
+		e.mu.Unlock()
 		return "", err
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.status != StatusPaused {
+		d.mu.Unlock()
+		e.mu.Unlock()
 		return "OK", nil
 	}
 	d.status = StatusWaiting
 	d.errorCode = ""
 	d.errorMessage = ""
 	e.waiting = append(e.waiting, d.gid)
+	d.mu.Unlock()
+	e.mu.Unlock()
 	e.signal()
+	e.saveSessionBestEffort()
 	return "OK", nil
 }
 
@@ -281,13 +300,14 @@ func (e *Engine) UnpauseAll() (string, error) {
 
 func (e *Engine) ChangePosition(gid string, pos int, how string) (int, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	d, err := e.findDownloadLocked(gid)
 	if err != nil {
+		e.mu.Unlock()
 		return 0, err
 	}
 	idx := indexOf(e.waiting, d.gid)
 	if idx < 0 {
+		e.mu.Unlock()
 		return 0, fmt.Errorf("download is not in waiting queue")
 	}
 	e.waiting = append(e.waiting[:idx], e.waiting[idx+1:]...)
@@ -300,6 +320,7 @@ func (e *Engine) ChangePosition(gid string, pos int, how string) (int, error) {
 	case "POS_END":
 		dst = len(e.waiting) + pos + 1
 	default:
+		e.mu.Unlock()
 		return 0, fmt.Errorf("invalid position mode")
 	}
 	if dst < 0 {
@@ -311,6 +332,8 @@ func (e *Engine) ChangePosition(gid string, pos int, how string) (int, error) {
 	e.waiting = append(e.waiting, "")
 	copy(e.waiting[dst+1:], e.waiting[dst:])
 	e.waiting[dst] = d.gid
+	e.mu.Unlock()
+	e.saveSessionBestEffort()
 	return dst, nil
 }
 
@@ -330,7 +353,6 @@ func (e *Engine) ChangeURI(gid string, fileIndex int, delURIs []string, addURIs 
 		return nil, err
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	deleted := 0
 	for _, raw := range delURIs {
 		for i, u := range d.uris {
@@ -359,6 +381,8 @@ func (e *Engine) ChangeURI(gid string, fileIndex int, delURIs []string, addURIs 
 	d.uris = append(d.uris, make([]URIInfo, len(newInfos))...)
 	copy(d.uris[insertAt+len(newInfos):], d.uris[insertAt:])
 	copy(d.uris[insertAt:], newInfos)
+	d.mu.Unlock()
+	e.saveSessionBestEffort()
 	return []int{deleted, added}, nil
 }
 
@@ -386,6 +410,7 @@ func (e *Engine) ChangeOption(gid string, opts Options) (string, error) {
 	d.dir = optionString(d.options, "dir")
 	d.out = optionString(d.options, "out")
 	d.mu.Unlock()
+	e.saveSessionBestEffort()
 	return "OK", nil
 }
 
@@ -397,11 +422,12 @@ func (e *Engine) GetGlobalOption() map[string]any {
 
 func (e *Engine) ChangeGlobalOption(opts Options) (string, error) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.global = mergeOptions(e.global, opts)
 	e.cfg.MaxConcurrentDownloads = optionInt(e.global, "max-concurrent-downloads", e.cfg.MaxConcurrentDownloads)
 	e.cfg.MaxDownloadResult = optionInt(e.global, "max-download-result", e.cfg.MaxDownloadResult)
+	e.mu.Unlock()
 	e.signal()
+	e.saveSessionBestEffort()
 	return "OK", nil
 }
 
@@ -444,36 +470,4 @@ func (e *Engine) GetVersion() VersionInfo {
 
 func (e *Engine) GetSessionInfo() SessionInfo {
 	return SessionInfo{SessionID: e.sessionID}
-}
-
-func (e *Engine) SaveSession() (string, error) {
-	e.mu.RLock()
-	path := optionString(e.global, "save-session")
-	e.mu.RUnlock()
-	if path == "" {
-		return "OK", nil
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	for _, d := range e.downloadsSnapshot() {
-		d.mu.RLock()
-		if isTerminal(d.status) {
-			d.mu.RUnlock()
-			continue
-		}
-		if len(d.uris) > 0 {
-			_, _ = fmt.Fprintln(f, d.uris[0].URI)
-			for k, v := range optionsForRPC(d.options) {
-				if k == "gid" {
-					continue
-				}
-				_, _ = fmt.Fprintf(f, "  %s=%v\n", k, v)
-			}
-		}
-		d.mu.RUnlock()
-	}
-	return "OK", nil
 }

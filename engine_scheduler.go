@@ -98,6 +98,7 @@ func (e *Engine) finishDownload(d *Download, err error) {
 		e.notify(notification, d.gid)
 	}
 	e.signal()
+	e.saveSessionBestEffort()
 }
 
 func (e *Engine) remove(gid string, force bool) (string, error) {
@@ -124,6 +125,7 @@ func (e *Engine) remove(gid string, force bool) (string, error) {
 	}
 	e.notify("aria2.onDownloadStop", d.gid)
 	e.signal()
+	e.saveSessionBestEffort()
 	return "OK", nil
 }
 
@@ -154,6 +156,7 @@ func (e *Engine) pause(gid string, force bool) (string, error) {
 	}
 	e.notify("aria2.onDownloadPause", d.gid)
 	e.signal()
+	e.saveSessionBestEffort()
 	return "OK", nil
 }
 

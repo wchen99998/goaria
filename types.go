@@ -33,6 +33,8 @@ type Config struct {
 	MaxConcurrentDownloads int
 	MaxDownloadResult      int
 	UserAgent              string
+	InputFile              string
+	SaveSession            string
 	HTTPClient             *http.Client
 	Logger                 *zap.Logger
 }

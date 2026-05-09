@@ -14,6 +14,12 @@ Run an aria2-style JSON-RPC daemon:
 go run ./cmd/goaria daemon -listen :6800 -dir ./downloads -rpc-secret secret
 ```
 
+Persist and restore the daemon queue with an aria2-style session file:
+
+```sh
+go run ./cmd/goaria daemon -dir ./downloads -input-file ./goaria.session -save-session ./goaria.session
+```
+
 Download directly from the CLI:
 
 ```sh
@@ -121,6 +127,7 @@ Implemented HTTP/S behaviors include:
 - segmented range downloads through `split`, `max-connection-per-server`, and `min-split-size`
 - retry and recovery through `max-tries`, `retry-wait`, and `max-file-not-found`
 - resume through `continue=true` when servers support byte ranges
+- queue/session persistence through `save-session`, `aria2.saveSession`, and daemon `-input-file` / `-save-session`
 - fallback across multiple HTTP/S URIs for the same resource
 - per-download HTTP headers, `user-agent`, `referer`, `http-no-cache`, and Basic auth through `http-user` / `http-passwd`
 - conditional requests through `conditional-get`, optional `use-head=false`, `http-accept-gzip`, and `http-auth-challenge`

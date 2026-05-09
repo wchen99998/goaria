@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +21,15 @@ import (
 
 const (
 	DefaultAddr           = ":6800"
+	DefaultPath           = "/jsonrpc"
 	DefaultMaxRequestSize = 2 << 20
 )
 
 type Config struct {
-	Addr           string
+	Addr string
+	// Path is the route registered by Handler and ListenAndServe. The
+	// default is /jsonrpc, matching aria2.
+	Path           string
 	MaxRequestSize int64
 	Secret         string
 	Logger         *zap.Logger
@@ -34,6 +39,7 @@ type Server struct {
 	engine   *goaria.Engine
 	rpc      *Handler
 	addr     string
+	path     string
 	maxBody  int64
 	log      *zap.Logger
 	server   *http.Server
@@ -44,6 +50,7 @@ func NewServer(engine *goaria.Engine, cfg Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = DefaultAddr
 	}
+	cfg.Path = normalizePath(cfg.Path)
 	if cfg.MaxRequestSize <= 0 {
 		cfg.MaxRequestSize = DefaultMaxRequestSize
 	}
@@ -55,6 +62,7 @@ func NewServer(engine *goaria.Engine, cfg Config) *Server {
 		engine:  engine,
 		rpc:     NewHandler(engine, cfg.Secret),
 		addr:    cfg.Addr,
+		path:    cfg.Path,
 		maxBody: cfg.MaxRequestSize,
 		log:     log,
 		upgrader: websocket.Upgrader{
@@ -65,8 +73,14 @@ func NewServer(engine *goaria.Engine, cfg Config) *Server {
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/jsonrpc", s.handleJSONRPC)
+	mux.Handle(s.path, s.JSONRPCHandler())
 	return mux
+}
+
+// JSONRPCHandler returns only the JSON-RPC endpoint handler, without creating
+// or owning a mux. Mount it on an existing net/http, Gin, or compatible router.
+func (s *Server) JSONRPCHandler() http.Handler {
+	return http.HandlerFunc(s.handleJSONRPC)
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -105,6 +119,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func normalizePath(path string) string {
+	if path == "" {
+		return DefaultPath
+	}
+	if !strings.HasPrefix(path, "/") {
+		return "/" + path
+	}
+	return path
 }
 
 func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {

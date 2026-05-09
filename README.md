@@ -50,6 +50,25 @@ srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: ":6800", Secret: "secret"}
 err := srv.ListenAndServe(ctx)
 ```
 
+If you already own the HTTP server or router, mount only the JSON-RPC endpoint:
+
+```go
+srv := jsonrpc.NewServer(engine, jsonrpc.Config{Secret: "secret"})
+mux.Handle("/downloads/rpc", srv.JSONRPCHandler())
+```
+
+With Gin, wrap the same handler:
+
+```go
+router.Any("/downloads/rpc", gin.WrapH(srv.JSONRPCHandler()))
+```
+
+For a server owned by `jsonrpc.Server`, use `Config.Path` to change the route:
+
+```go
+srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: ":6800", Path: "/downloads/rpc", Secret: "secret"})
+```
+
 ## RPC Coverage
 
 The aria2 JSON-RPC method surface is implemented:

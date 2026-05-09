@@ -122,6 +122,53 @@ func TestRPCPostGetBatchAndMulticall(t *testing.T) {
 	}
 }
 
+func TestServerCustomPathAndMountableHandler(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	customPathServer := httptest.NewServer(NewServer(engine, Config{Path: "rpc"}).Handler())
+	defer customPathServer.Close()
+
+	resp := postListMethods(t, customPathServer.URL+"/rpc")
+	if resp.Error != nil || resp.Result == nil {
+		t.Fatalf("listMethods on custom path failed: %#v", resp)
+	}
+
+	httpResp, err := http.Post(customPathServer.URL+"/jsonrpc", "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":"miss","method":"system.listMethods"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected default path to be unregistered, got %s", httpResp.Status)
+	}
+
+	mounted := NewServer(engine, Config{}).JSONRPCHandler()
+	mux := http.NewServeMux()
+	mux.Handle("/downloads/rpc", mounted)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	existingServer := httptest.NewServer(mux)
+	defer existingServer.Close()
+
+	resp = postListMethods(t, existingServer.URL+"/downloads/rpc")
+	if resp.Error != nil || resp.Result == nil {
+		t.Fatalf("listMethods on mounted handler failed: %#v", resp)
+	}
+	health, err := http.Get(existingServer.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	health.Body.Close()
+	if health.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected existing route to keep working, got %s", health.Status)
+	}
+}
+
 func TestWebSocketJSONRPCAndNotification(t *testing.T) {
 	data := []byte("hello websocket")
 	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -169,6 +216,20 @@ func TestWebSocketJSONRPCAndNotification(t *testing.T) {
 			return
 		}
 	}
+}
+
+func postListMethods(t *testing.T, url string) rpcResponse {
+	t.Helper()
+	httpResp, err := http.Post(url, "application/json", strings.NewReader(`{"jsonrpc":"2.0","id":"methods","method":"system.listMethods"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpResp.Body.Close()
+	var resp rpcResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
 }
 
 func invokeRPC(t *testing.T, rpc *RPCHandler, payload string) rpcResponse {

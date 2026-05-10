@@ -13,6 +13,13 @@ import (
 	"golang.org/x/net/http2"
 )
 
+type downloadKind string
+
+const (
+	downloadKindURI     downloadKind = "uri"
+	downloadKindTorrent downloadKind = "torrent"
+)
+
 type Engine struct {
 	cfg              Config
 	log              *zap.Logger
@@ -52,23 +59,32 @@ type Engine struct {
 type Download struct {
 	mu sync.RWMutex
 
+	kind    downloadKind
 	gid     string
 	uris    []URIInfo
 	options Options
 
-	status       Status
-	dir          string
-	out          string
-	path         string
-	currentURI   string
-	totalLength  int64
-	completedLen int64
-	downloadBPS  int64
-	connections  int
-	pieceLength  int64
-	numPieces    int64
-	donePieces   int64
-	bitfield     string
+	status        Status
+	dir           string
+	out           string
+	path          string
+	currentURI    string
+	totalLength   int64
+	completedLen  int64
+	downloadBPS   int64
+	connections   int
+	pieceLength   int64
+	numPieces     int64
+	donePieces    int64
+	bitfield      string
+	infoHash      string
+	numSeeders    int
+	seeder        bool
+	bittorrent    *BittorrentInfo
+	torrent       *torrentRuntime
+	torrentFiles  []torrentFileState
+	torrentData   []byte
+	torrentMagnet string
 
 	errorCode    string
 	errorMessage string
@@ -187,7 +203,13 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 	if len(uris) == 0 {
 		return "", fmt.Errorf("no URI to download")
 	}
+	if len(uris) == 1 && isMagnetURI(uris[0]) {
+		return e.addMagnet(uris[0], opts, position)
+	}
 	for _, raw := range uris {
+		if isMagnetURI(raw) {
+			return "", ErrUnsupportedProtocol
+		}
 		if err := validateHTTPURI(raw); err != nil {
 			return "", err
 		}
@@ -229,8 +251,8 @@ func (e *Engine) AddURI(uris []string, opts Options, position *int) (string, err
 	return gid, nil
 }
 
-func (e *Engine) AddTorrent(string, []string, Options, *int) (string, error) {
-	return "", ErrUnsupportedMethod
+func (e *Engine) AddTorrent(torrent string, uris []string, opts Options, position *int) (string, error) {
+	return e.addTorrent(torrent, uris, opts, position)
 }
 
 func (e *Engine) AddMetalink(string, Options, *int) ([]string, error) {
@@ -464,7 +486,7 @@ func (e *Engine) RemoveDownloadResult(gid string) (string, error) {
 func (e *Engine) GetVersion() VersionInfo {
 	return VersionInfo{
 		Version:         Aria2CompatVersion,
-		EnabledFeatures: []string{"HTTP", "HTTPS", "JSON-RPC", "WebSocket"},
+		EnabledFeatures: []string{"BitTorrent", "HTTP", "HTTPS", "JSON-RPC", "WebSocket"},
 	}
 }
 

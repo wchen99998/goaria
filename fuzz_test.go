@@ -1,6 +1,9 @@
 package goaria
 
 import (
+	"context"
+	"encoding/base64"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -149,5 +152,24 @@ func FuzzPathsAndBitfield(f *testing.F) {
 		if got != "" && len(got)%2 != 0 {
 			t.Fatalf("bitfield has odd hex length: %q", got)
 		}
+	})
+}
+
+func FuzzAddTorrentMetadata(f *testing.F) {
+	f.Add([]byte("not a torrent"))
+	if data, err := os.ReadFile("test.torrent"); err == nil {
+		f.Add(data)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		if len(data) == 0 || len(data) > 256<<10 {
+			t.Skip()
+		}
+		engine, err := NewEngine(Config{Dir: t.TempDir(), MaxConcurrentDownloads: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer engine.Close(context.Background())
+		_, _ = engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{"pause": "true"}, nil)
 	})
 }

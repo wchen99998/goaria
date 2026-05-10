@@ -43,11 +43,18 @@ func (e *Engine) GetFiles(gid string) ([]FileInfo, error) {
 
 func (e *Engine) GetPeers(gid string) ([]map[string]string, error) {
 	e.mu.RLock()
-	_, err := e.findDownloadLocked(gid)
+	d, err := e.findDownloadLocked(gid)
 	e.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
+	d.mu.RLock()
+	if d.kind == downloadKindTorrent {
+		out := d.torrentPeersLocked()
+		d.mu.RUnlock()
+		return out, nil
+	}
+	d.mu.RUnlock()
 	return []map[string]string{}, nil
 }
 
@@ -217,6 +224,14 @@ func (d *Download) snapshot(keys []string) map[string]any {
 			"dir":             d.dir,
 			"files":           d.filesLocked(),
 		}
+		if d.kind == downloadKindTorrent {
+			all["infoHash"] = d.infoHash
+			all["numSeeders"] = strconv.Itoa(d.numSeeders)
+			all["seeder"] = strconv.FormatBool(d.seeder)
+			if d.bittorrent != nil {
+				all["bittorrent"] = d.bittorrent
+			}
+		}
 		if d.errorCode != "" {
 			all["errorCode"] = d.errorCode
 		}
@@ -255,6 +270,22 @@ func (d *Download) snapshot(keys []string) map[string]any {
 			filtered[key] = d.dir
 		case "files":
 			filtered[key] = d.filesLocked()
+		case "infoHash":
+			if d.kind == downloadKindTorrent {
+				filtered[key] = d.infoHash
+			}
+		case "numSeeders":
+			if d.kind == downloadKindTorrent {
+				filtered[key] = strconv.Itoa(d.numSeeders)
+			}
+		case "seeder":
+			if d.kind == downloadKindTorrent {
+				filtered[key] = strconv.FormatBool(d.seeder)
+			}
+		case "bittorrent":
+			if d.kind == downloadKindTorrent && d.bittorrent != nil {
+				filtered[key] = d.bittorrent
+			}
 		case "errorCode":
 			if d.errorCode != "" {
 				filtered[key] = d.errorCode
@@ -269,6 +300,20 @@ func (d *Download) snapshot(keys []string) map[string]any {
 }
 
 func (d *Download) filesLocked() []FileInfo {
+	if d.kind == downloadKindTorrent {
+		out := make([]FileInfo, 0, len(d.torrentFiles))
+		for _, f := range d.torrentFiles {
+			out = append(out, FileInfo{
+				Index:           strconv.Itoa(f.Index),
+				Path:            f.Path,
+				Length:          strconv.FormatInt(f.Length, 10),
+				CompletedLength: strconv.FormatInt(f.Completed, 10),
+				Selected:        strconv.FormatBool(f.Selected),
+				URIs:            cloneURIs(f.URIs),
+			})
+		}
+		return out
+	}
 	path := d.path
 	if path == "" {
 		name := d.out

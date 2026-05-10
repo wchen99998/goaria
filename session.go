@@ -2,6 +2,7 @@ package goaria
 
 import (
 	"bufio"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,11 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+)
+
+const (
+	sessionMaxLineSize          = 4 * 1024 * 1024
+	sessionTorrentDataURIPrefix = "data:application/x-bittorrent;base64,"
 )
 
 type sessionDownload struct {
@@ -45,11 +51,6 @@ func (e *Engine) loadSession(path string) error {
 		if len(item.uris) == 0 {
 			continue
 		}
-		for _, raw := range item.uris {
-			if err := validateHTTPURI(raw); err != nil {
-				return fmt.Errorf("%s:%d: %w", path, item.line, err)
-			}
-		}
 		merged := layerOptions(e.global, item.options)
 		gid := optionString(merged, "gid")
 		if gid == "" {
@@ -60,7 +61,42 @@ func (e *Engine) loadSession(path string) error {
 		if _, exists := e.downloads[gid]; exists {
 			return fmt.Errorf("%s:%d: gid already exists", path, item.line)
 		}
-		d := newDownload(gid, item.uris, merged)
+
+		var d *Download
+		if data, ok, err := decodeSessionTorrentDataURI(item.uris[0]); err != nil {
+			return fmt.Errorf("%s:%d: %w", path, item.line, err)
+		} else if ok {
+			webseeds := item.uris[1:]
+			for _, raw := range webseeds {
+				if err := validateHTTPURI(raw); err != nil {
+					return fmt.Errorf("%s:%d: %w", path, item.line, err)
+				}
+			}
+			mi, info, err := torrentMetaInfo(data)
+			if err != nil {
+				return fmt.Errorf("%s:%d: %w", path, item.line, err)
+			}
+			if _, _, err := torrentSelectionAndIndexOut(info, merged); err != nil {
+				return fmt.Errorf("%s:%d: %w", path, item.line, err)
+			}
+			d = newTorrentDownload(gid, data, "", webseeds, merged, mi, info)
+		} else if len(item.uris) == 1 && isMagnetURI(item.uris[0]) {
+			var err error
+			d, err = newMagnetDownload(gid, item.uris[0], merged)
+			if err != nil {
+				return fmt.Errorf("%s:%d: %w", path, item.line, err)
+			}
+		} else {
+			for _, raw := range item.uris {
+				if isMagnetURI(raw) {
+					return fmt.Errorf("%s:%d: %w", path, item.line, ErrUnsupportedProtocol)
+				}
+				if err := validateHTTPURI(raw); err != nil {
+					return fmt.Errorf("%s:%d: %w", path, item.line, err)
+				}
+			}
+			d = newDownload(gid, item.uris, merged)
+		}
 		if optionBool(merged, "pause") {
 			d.status = StatusPaused
 		} else {
@@ -73,7 +109,7 @@ func (e *Engine) loadSession(path string) error {
 
 func parseSession(r io.Reader) ([]sessionItem, error) {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), sessionMaxLineSize)
 
 	var items []sessionItem
 	var current *sessionItem
@@ -115,6 +151,22 @@ func parseSession(r io.Reader) ([]sessionItem, error) {
 	}
 	flush()
 	return items, nil
+}
+
+func encodeSessionTorrentDataURI(data []byte) string {
+	return sessionTorrentDataURIPrefix + base64.StdEncoding.EncodeToString(data)
+}
+
+func decodeSessionTorrentDataURI(raw string) ([]byte, bool, error) {
+	encoded, ok := strings.CutPrefix(raw, sessionTorrentDataURIPrefix)
+	if !ok {
+		return nil, false, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, true, fmt.Errorf("invalid session torrent data URI: %w", err)
+	}
+	return data, true, nil
 }
 
 func (i *sessionItem) addOption(key string, value any) {
@@ -194,9 +246,27 @@ func (e *Engine) sessionSnapshot() []sessionDownload {
 			d.mu.RUnlock()
 			continue
 		}
-		uris := make([]string, 0, len(d.uris))
-		for _, u := range d.uris {
-			uris = append(uris, u.URI)
+		var uris []string
+		if d.kind == downloadKindTorrent {
+			switch {
+			case d.torrentMagnet != "":
+				uris = []string{d.torrentMagnet}
+			case len(d.torrentData) > 0:
+				uris = []string{encodeSessionTorrentDataURI(d.torrentData)}
+				for _, u := range d.uris {
+					uris = append(uris, u.URI)
+				}
+			default:
+				uris = make([]string, 0, len(d.uris))
+				for _, u := range d.uris {
+					uris = append(uris, u.URI)
+				}
+			}
+		} else {
+			uris = make([]string, 0, len(d.uris))
+			for _, u := range d.uris {
+				uris = append(uris, u.URI)
+			}
 		}
 		opts := optionsForRPC(d.options)
 		opts["gid"] = d.gid

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -119,6 +120,72 @@ func TestRPCPostGetBatchAndMulticall(t *testing.T) {
 	}
 	if mc.Error != nil {
 		t.Fatalf("multicall failed: %#v", mc.Error)
+	}
+}
+
+func TestRPCAddTorrentWithRealTorrentMetadata(t *testing.T) {
+	data, err := os.ReadFile("../test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	rpc := NewHandler(engine, "")
+
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "torrent",
+		"method":  "aria2.addTorrent",
+		"params": []any{
+			base64.StdEncoding.EncodeToString(data),
+			map[string]any{"pause": "true"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := invokeRPC(t, rpc, string(payload))
+	if resp.Error != nil {
+		t.Fatalf("addTorrent failed: %#v", resp.Error)
+	}
+	var gid string
+	raw, _ := json.Marshal(resp.Result)
+	if err := json.Unmarshal(raw, &gid); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, err = json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "status",
+		"method":  "aria2.tellStatus",
+		"params":  []any{gid, []string{"status", "infoHash", "bittorrent", "files"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = invokeRPC(t, rpc, string(payload))
+	if resp.Error != nil {
+		t.Fatalf("tellStatus failed: %#v", resp.Error)
+	}
+	var status map[string]any
+	raw, _ = json.Marshal(resp.Result)
+	if err := json.Unmarshal(raw, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != string(goaria.StatusPaused) {
+		t.Fatalf("status = %v, want paused", status["status"])
+	}
+	if len(status["infoHash"].(string)) != 40 {
+		t.Fatalf("bad infoHash: %#v", status["infoHash"])
+	}
+	if _, ok := status["bittorrent"].(map[string]any); !ok {
+		t.Fatalf("missing bittorrent metadata: %#v", status)
+	}
+	if files, ok := status["files"].([]any); !ok || len(files) == 0 {
+		t.Fatalf("missing files: %#v", status["files"])
 	}
 }
 

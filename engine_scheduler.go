@@ -256,6 +256,7 @@ func newDownload(gid string, uris []string, opts Options) *Download {
 		infos = append(infos, URIInfo{URI: raw, Status: status})
 	}
 	return &Download{
+		kind:      downloadKindURI,
 		gid:       gid,
 		uris:      infos,
 		options:   opts,

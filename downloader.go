@@ -183,6 +183,13 @@ func (l *rateLimiter) wait(n int64) {
 }
 
 func (e *Engine) runDownload(d *Download) error {
+	d.mu.RLock()
+	kind := d.kind
+	d.mu.RUnlock()
+	if kind == downloadKindTorrent {
+		return e.runTorrentDownload(d)
+	}
+
 	var oneURI [1]URIInfo
 	var uris []URIInfo
 	d.mu.RLock()

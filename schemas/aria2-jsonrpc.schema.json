@@ -88,15 +88,28 @@
         "all-proxy-user": { "type": "string", "maxLength": 256 },
         "allow-overwrite": { "$ref": "#/$defs/boolString" },
         "auto-file-renaming": { "$ref": "#/$defs/boolString" },
+        "bt-exclude-tracker": { "type": "string", "maxLength": 4096 },
+        "bt-max-peers": { "$ref": "#/$defs/nonNegativeString" },
+        "bt-metadata-only": { "$ref": "#/$defs/boolString" },
+        "bt-tracker": { "type": "string", "maxLength": 4096 },
         "check-certificate": { "$ref": "#/$defs/boolString" },
         "checksum": { "type": "string", "maxLength": 512 },
         "conditional-get": { "$ref": "#/$defs/boolString" },
         "connect-timeout": { "$ref": "#/$defs/nonNegativeString" },
         "continue": { "$ref": "#/$defs/boolString" },
         "dir": { "type": "string", "maxLength": 4096 },
+        "disable-ipv6": { "$ref": "#/$defs/boolString" },
+        "disable-utp": { "$ref": "#/$defs/boolString" },
         "dry-run": { "$ref": "#/$defs/boolString" },
         "enable-http-keep-alive": { "$ref": "#/$defs/boolString" },
         "gid": { "$ref": "#/$defs/gid" },
+        "goaria-disable-dht": { "$ref": "#/$defs/boolString" },
+        "goaria-disable-trackers": { "$ref": "#/$defs/boolString" },
+        "goaria-disable-utp": { "$ref": "#/$defs/boolString" },
+        "goaria-listen-host": { "type": "string", "maxLength": 256 },
+        "goaria-peer-addrs": { "$ref": "#/$defs/stringList" },
+        "goaria-torrent-max-active-files": { "$ref": "#/$defs/nonNegativeString" },
+        "goaria-torrent-readahead": { "$ref": "#/$defs/sizeString" },
         "header": { "$ref": "#/$defs/stringList" },
         "http-accept-gzip": { "$ref": "#/$defs/boolString" },
         "http-auth-challenge": { "$ref": "#/$defs/boolString" },
@@ -110,7 +123,9 @@
         "https-proxy": { "type": "string", "maxLength": 2048 },
         "https-proxy-passwd": { "type": "string", "maxLength": 256 },
         "https-proxy-user": { "type": "string", "maxLength": 256 },
+        "index-out": { "$ref": "#/$defs/stringList" },
         "lowest-speed-limit": { "$ref": "#/$defs/nonNegativeString" },
+        "listen-port": { "$ref": "#/$defs/nonNegativeString" },
         "max-concurrent-downloads": { "$ref": "#/$defs/nonNegativeString" },
         "max-connection-per-server": { "$ref": "#/$defs/nonNegativeString" },
         "max-download-limit": { "$ref": "#/$defs/sizeString" },
@@ -118,6 +133,7 @@
         "max-file-not-found": { "$ref": "#/$defs/nonNegativeString" },
         "max-overall-download-limit": { "$ref": "#/$defs/sizeString" },
         "max-tries": { "$ref": "#/$defs/nonNegativeString" },
+        "max-upload-limit": { "$ref": "#/$defs/sizeString" },
         "min-split-size": { "$ref": "#/$defs/sizeString" },
         "no-proxy": { "type": "string", "maxLength": 2048 },
         "out": { "type": "string", "maxLength": 4096 },
@@ -125,6 +141,7 @@
         "remote-time": { "$ref": "#/$defs/boolString" },
         "retry-wait": { "$ref": "#/$defs/nonNegativeString" },
         "save-session": { "type": "string", "maxLength": 4096 },
+        "select-file": { "type": "string", "maxLength": 2048 },
         "split": { "$ref": "#/$defs/nonNegativeString" },
         "timeout": { "$ref": "#/$defs/nonNegativeString" },
         "use-head": { "$ref": "#/$defs/boolString" },
@@ -190,7 +207,7 @@
               "oneOf": [
                 {
                   "type": "array",
-                  "minItems": 1,
+                  "minItems": 2,
                   "maxItems": 4,
                   "prefixItems": [
                     { "type": "string", "maxLength": 1048576 },
@@ -201,12 +218,33 @@
                 },
                 {
                   "type": "array",
-                  "minItems": 2,
+                  "minItems": 1,
+                  "maxItems": 3,
+                  "prefixItems": [
+                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 3,
                   "maxItems": 5,
                   "prefixItems": [
                     { "$ref": "#/$defs/token" },
                     { "type": "string", "maxLength": 1048576 },
                     { "$ref": "#/$defs/uriList" },
+                    { "$ref": "#/$defs/options" },
+                    { "$ref": "#/$defs/position" }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 4,
+                  "prefixItems": [
+                    { "$ref": "#/$defs/token" },
+                    { "type": "string", "maxLength": 1048576 },
                     { "$ref": "#/$defs/options" },
                     { "$ref": "#/$defs/position" }
                   ]

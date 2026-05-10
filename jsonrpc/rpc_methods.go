@@ -1,6 +1,10 @@
 package jsonrpc
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/wchen99998/goaria"
+)
 
 var notificationMethods = []string{
 	"aria2.onDownloadStart",
@@ -32,14 +36,32 @@ func (h *RPCHandler) invoke(method string, params []json.RawMessage) (any, error
 		if err != nil {
 			return nil, err
 		}
-		uris, _ := optionalStringSliceParam(params, 1)
-		opts, err := optionsParam(params, 2, false)
-		if err != nil {
-			return nil, err
-		}
-		pos, err := optionalIntParam(params, 3)
-		if err != nil {
-			return nil, err
+		var uris []string
+		var opts goaria.Options
+		var pos *int
+		if len(params) > 1 {
+			if parsedURIs, uriErr := optionalStringSliceParam(params, 1); uriErr == nil {
+				uris = parsedURIs
+				opts, err = optionsParam(params, 2, false)
+				if err != nil {
+					return nil, err
+				}
+				pos, err = optionalIntParam(params, 3)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				opts, err = optionsParam(params, 1, false)
+				if err != nil {
+					return nil, err
+				}
+				pos, err = optionalIntParam(params, 2)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			opts = goaria.Options{}
 		}
 		return h.engine.AddTorrent(torrent, uris, opts, pos)
 	case "aria2.addMetalink":

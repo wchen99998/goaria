@@ -35,6 +35,7 @@ func (e *Engine) do(req *http.Request, opts Options) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	client = clientWithLoadedCookies(client, optionString(opts, "load-cookies"))
 	return client.Do(req)
 }
 

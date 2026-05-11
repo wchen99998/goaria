@@ -11,7 +11,7 @@ import (
 
 const (
 	// Version is the goaria package version.
-	Version = "0.1.0"
+	Version = "0.2.0"
 
 	// Aria2CompatVersion is reported through aria2.getVersion.
 	Aria2CompatVersion = "1.37.0-goaria"

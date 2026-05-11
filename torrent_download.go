@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	g "github.com/anacrolix/generics"
 	"github.com/wchen99998/torrent"
 	"github.com/wchen99998/torrent/bencode"
 	"github.com/wchen99998/torrent/metainfo"
@@ -44,15 +46,12 @@ func isMagnetURI(raw string) bool {
 	return err == nil && strings.EqualFold(u.Scheme, "magnet")
 }
 
+func isHTTPTorrentURL(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Host != "" && (u.Scheme == "http" || u.Scheme == "https")
+}
+
 func (e *Engine) addTorrent(torrentData string, uris []string, opts Options, position *int) (string, error) {
-	data, err := decodeTorrentParam(torrentData)
-	if err != nil {
-		return "", err
-	}
-	mi, info, err := torrentMetaInfo(data)
-	if err != nil {
-		return "", err
-	}
 	for _, raw := range uris {
 		if err := validateHTTPURI(raw); err != nil {
 			return "", err
@@ -62,15 +61,29 @@ func (e *Engine) addTorrent(torrentData string, uris []string, opts Options, pos
 		opts = Options{}
 	}
 
+	e.mu.RLock()
+	if err := e.ctx.Err(); err != nil {
+		e.mu.RUnlock()
+		return "", ErrShutdown
+	}
+	merged := layerOptions(cloneOptions(e.global), opts)
+	e.mu.RUnlock()
+
+	data, mi, info, sourceURL, err := e.resolveTorrentSource(torrentData, merged)
+	if err != nil {
+		return "", err
+	}
+	if sourceURL != "" {
+		merged["goaria-torrent-source-url"] = sourceURL
+	}
+	if _, _, err := torrentSelectionAndIndexOut(info, merged); err != nil {
+		return "", err
+	}
+
 	e.mu.Lock()
 	if err := e.ctx.Err(); err != nil {
 		e.mu.Unlock()
 		return "", ErrShutdown
-	}
-	merged := layerOptions(e.global, opts)
-	if _, _, err := torrentSelectionAndIndexOut(info, merged); err != nil {
-		e.mu.Unlock()
-		return "", err
 	}
 	gid := optionString(merged, "gid")
 	if gid == "" {
@@ -94,6 +107,112 @@ func (e *Engine) addTorrent(torrentData string, uris []string, opts Options, pos
 	e.signal()
 	e.saveSessionBestEffort()
 	return gid, nil
+}
+
+func (e *Engine) resolveTorrentSource(raw string, opts Options) ([]byte, *metainfo.MetaInfo, metainfo.Info, string, error) {
+	data, decodeErr := decodeTorrentParam(raw)
+	if decodeErr == nil {
+		mi, info, metaErr := torrentMetaInfo(data)
+		if metaErr == nil {
+			return data, mi, info, "", nil
+		}
+		if !isHTTPTorrentURL(raw) {
+			return nil, nil, metainfo.Info{}, "", metaErr
+		}
+	} else if !isHTTPTorrentURL(raw) {
+		return nil, nil, metainfo.Info{}, "", decodeErr
+	}
+
+	data, err := e.fetchTorrentURL(e.ctx, raw, opts)
+	if err != nil {
+		return nil, nil, metainfo.Info{}, "", err
+	}
+	mi, info, err := torrentMetaInfo(data)
+	if err != nil {
+		return nil, nil, metainfo.Info{}, "", err
+	}
+	return data, mi, info, raw, nil
+}
+
+const defaultMaxTorrentSize = 16 << 20
+
+type torrentResponseSizeError struct {
+	max int64
+}
+
+func (e *torrentResponseSizeError) Error() string {
+	return fmt.Sprintf("torrent response exceeds goaria-max-torrent-size %d", e.max)
+}
+
+func (e *Engine) fetchTorrentURL(ctx context.Context, raw string, opts Options) ([]byte, error) {
+	if err := validateHTTPURI(raw); err != nil {
+		return nil, err
+	}
+	maxSize := optionBytes(opts, "goaria-max-torrent-size", defaultMaxTorrentSize)
+	if maxSize <= 0 {
+		maxSize = defaultMaxTorrentSize
+	}
+	maxTries := optionInt(opts, "max-tries", 5)
+	if maxTries < 0 {
+		maxTries = 1
+	}
+	retryWait := time.Duration(optionInt(opts, "retry-wait", 0)) * time.Second
+	var lastErr error
+	for attempt := 0; maxTries == 0 || attempt < maxTries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		data, err := e.fetchTorrentURLOnce(ctx, raw, opts, maxSize)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		var sizeErr *torrentResponseSizeError
+		if errors.As(err, &sizeErr) {
+			break
+		}
+		if !isRetryableDownloadError(err) {
+			break
+		}
+		if retryWait > 0 {
+			if err := sleepContext(ctx, retryWait); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return nil, lastErr
+}
+
+func (e *Engine) fetchTorrentURLOnce(ctx context.Context, raw string, opts Options, maxSize int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyRequestOptions(req, opts)
+	resp, err := e.do(req, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, &httpStatusError{Method: http.MethodGet, URL: raw, StatusCode: resp.StatusCode, Status: resp.Status}
+	}
+	if resp.ContentLength > maxSize {
+		return nil, &torrentResponseSizeError{max: maxSize}
+	}
+	body, closeBody, err := responseReader(resp, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer closeBody()
+	data, err := io.ReadAll(io.LimitReader(body, maxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxSize {
+		return nil, &torrentResponseSizeError{max: maxSize}
+	}
+	return data, nil
 }
 
 func (e *Engine) addMagnet(raw string, opts Options, position *int) (string, error) {
@@ -379,6 +498,7 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	cfg.DefaultStorage = storage.NewFileOpts(storage.NewFileClientOpts{
 		ClientBaseDir:      dir,
 		PieceCompletion:    storage.NewMapPieceCompletion(),
+		UsePartFiles:       g.Some(false),
 		ForceClassicFileIO: true,
 		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
 		FilePathMaker:      torrentFilePathMaker(opts),
@@ -478,20 +598,15 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 		e.notify("aria2.onBtDownloadComplete", d.gid)
 		return nil
 	}
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	for {
+	for _, item := range selected {
+		if err := item.file.WaitComplete(ctx); err != nil {
+			item.file.SetPriority(torrent.PiecePriorityNone)
+			return err
+		}
 		e.updateTorrentProgress(d, tor)
-		if torrentFilesComplete(selected) {
-			e.notify("aria2.onBtDownloadComplete", d.gid)
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
 	}
+	e.notify("aria2.onBtDownloadComplete", d.gid)
+	return nil
 }
 
 func applyTorrentTrackerOptions(spec *torrent.TorrentSpec, opts Options) {
@@ -544,21 +659,18 @@ func torrentFilePathMaker(opts Options) storage.FilePathMaker {
 	if len(indexOut) == 0 {
 		return nil
 	}
-	var mu sync.Mutex
-	next := 0
-	return func(pathOpts storage.FilePathMakerOpts) string {
-		mu.Lock()
-		next++
-		index := next
-		mu.Unlock()
-		if override := indexOut[index]; override != "" {
-			return safeTorrentRelPath(override)
+	return func(pathOpts storage.FilePathMakerOpts) (string, error) {
+		if override := indexOut[pathOpts.FileIndex+1]; override != "" {
+			return safeTorrentRelPath(override), nil
+		}
+		if pathOpts.DefaultPath != "" {
+			return pathOpts.DefaultPath, nil
 		}
 		var parts []string
 		if pathOpts.Info.BestName() != metainfo.NoName {
 			parts = append(parts, pathOpts.Info.BestName())
 		}
-		return filepath.Join(append(parts, pathOpts.File.BestPath()...)...)
+		return filepath.Join(append(parts, pathOpts.File.BestPath()...)...), nil
 	}
 }
 
@@ -603,15 +715,6 @@ func selectedTorrentFiles(d *Download, files []*torrent.File) []selectedTorrentF
 	return out
 }
 
-func torrentFilesComplete(files []selectedTorrentFile) bool {
-	for _, item := range files {
-		if item.file.BytesCompleted() < item.file.Length() {
-			return false
-		}
-	}
-	return true
-}
-
 func (e *Engine) processCompletedTorrentFiles(ctx context.Context, d *Download, files []selectedTorrentFile) error {
 	if len(files) == 0 {
 		return nil
@@ -620,56 +723,36 @@ func (e *Engine) processCompletedTorrentFiles(ctx context.Context, d *Download, 
 	if maxActive <= 0 || maxActive > len(files) {
 		maxActive = len(files)
 	}
-	queued := append([]selectedTorrentFile(nil), files...)
-	downloading := make(map[int]selectedTorrentFile, maxActive)
+	slots := make(chan struct{}, maxActive)
 	results := make(chan error, len(files))
-	activeLeases := 0
-	ctxDone := ctx.Done()
 	var resultErr error
-	startSlots := func() {
-		for len(queued) > 0 && len(downloading)+activeLeases < maxActive {
-			item := queued[0]
-			queued = queued[1:]
-			item.file.Download()
-			downloading[item.index] = item
-		}
-	}
-	startSlots()
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
-	for len(queued) > 0 || len(downloading) > 0 || activeLeases > 0 {
-		e.updateTorrentProgress(d, files[0].file.Torrent())
-		for index, item := range downloading {
-			if item.file.BytesCompleted() < item.file.Length() {
-				continue
-			}
-			delete(downloading, index)
-			activeLeases++
-			go func(item selectedTorrentFile) {
-				results <- e.handleCompletedTorrentFile(ctx, d, item)
-			}(item)
-		}
-		if len(queued) == 0 && len(downloading) == 0 && activeLeases == 0 {
-			return resultErr
-		}
+	var wg sync.WaitGroup
+queue:
+	for _, item := range files {
 		select {
-		case err := <-results:
-			activeLeases--
-			resultErr = errors.Join(resultErr, err)
-			startSlots()
-		case <-ctxDone:
+		case slots <- struct{}{}:
+		case <-ctx.Done():
 			resultErr = errors.Join(resultErr, ctx.Err())
-			queued = nil
-			for index, item := range downloading {
-				item.file.SetPriority(torrent.PiecePriorityNone)
-				delete(downloading, index)
-			}
-			ctxDone = nil
-			if activeLeases == 0 {
-				return resultErr
-			}
-		case <-ticker.C:
+			break queue
 		}
+		wg.Add(1)
+		go func(item selectedTorrentFile) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			item.file.Download()
+			if err := item.file.WaitComplete(ctx); err != nil {
+				item.file.SetPriority(torrent.PiecePriorityNone)
+				results <- err
+				return
+			}
+			e.updateTorrentProgress(d, item.file.Torrent())
+			results <- e.handleCompletedTorrentFile(ctx, d, item)
+		}(item)
+	}
+	wg.Wait()
+	close(results)
+	for err := range results {
+		resultErr = errors.Join(resultErr, err)
 	}
 	return resultErr
 }

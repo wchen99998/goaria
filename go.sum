@@ -28,8 +28,6 @@ github.com/anacrolix/btree v0.1.1 h1:igdFPLrt82L6qovzbEGSMkTeiwcU3EFIGl2K8XWocAc
 github.com/anacrolix/btree v0.1.1/go.mod h1:KHWYRZuUULATjUGJC4dQDXx/BPOnWrJozGR6TndjOmc=
 github.com/anacrolix/chansync v0.7.0 h1:wgwxbsJRmOqNjil4INpxHrDp4rlqQhECxR8/WBP4Et0=
 github.com/anacrolix/chansync v0.7.0/go.mod h1:DZsatdsdXxD0WiwcGl0nJVwyjCKMDv+knl1q2iBjA2k=
-github.com/anacrolix/dht/v2 v2.23.0 h1:EuD17ykTTEkAMPLjBsS5QjGOwuBgLTdQhds6zPAjeVY=
-github.com/anacrolix/dht/v2 v2.23.0/go.mod h1:seXRz6HLw8zEnxlysf9ye2eQbrKUmch6PyOHpe/Nb/U=
 github.com/anacrolix/envpprof v0.0.0-20180404065416-323002cec2fa/go.mod h1:KgHhUaQMc8cC0+cEflSgCFNFbKwi5h54gqtVn8yhP7c=
 github.com/anacrolix/envpprof v1.0.0/go.mod h1:KgHhUaQMc8cC0+cEflSgCFNFbKwi5h54gqtVn8yhP7c=
 github.com/anacrolix/envpprof v1.1.0/go.mod h1:My7T5oSqVfEn4MD4Meczkw/f5lSIndGAKu/0SM/rkf4=
@@ -74,8 +72,6 @@ github.com/anacrolix/sync v0.5.5-0.20251119100342-d78dd1f686f1/go.mod h1:21cUWer
 github.com/anacrolix/tagflag v0.0.0-20180109131632-2146c8d41bf0/go.mod h1:1m2U/K6ZT+JZG0+bdMK6qauP49QT4wE5pmhJXOKKCHw=
 github.com/anacrolix/tagflag v1.0.0/go.mod h1:1m2U/K6ZT+JZG0+bdMK6qauP49QT4wE5pmhJXOKKCHw=
 github.com/anacrolix/tagflag v1.1.0/go.mod h1:Scxs9CV10NQatSmbyjqmqmeQNwGzlNe0CMUMIxqHIG8=
-github.com/anacrolix/torrent v1.48.1-0.20230103142631-c20f73d53e9f h1:5fPzkRgj1BFYzQinFQqilCPM9A/EuPUXzSC3utjMVGc=
-github.com/anacrolix/torrent v1.48.1-0.20230103142631-c20f73d53e9f/go.mod h1:PwdFzmApEr96LcqogJhuw41XOdd1oHGkp+qE9hhXyDc=
 github.com/anacrolix/upnp v0.1.4 h1:+2t2KA6QOhm/49zeNyeVwDu1ZYS9dB9wfxyVvh/wk7U=
 github.com/anacrolix/upnp v0.1.4/go.mod h1:Qyhbqo69gwNWvEk1xNTXsS5j7hMHef9hdr984+9fIic=
 github.com/anacrolix/utp v0.1.0 h1:FOpQOmIwYsnENnz7tAGohA+r6iXpRjrq8ssKSre2Cp4=
@@ -360,8 +356,10 @@ github.com/tidwall/btree v1.8.1/go.mod h1:jBbTdUWhSZClZWoDg54VnvV7/54modSOzDN7VX
 github.com/tinylib/msgp v1.0.2/go.mod h1:+d+yLhGm8mzTaHzB+wgMYrodPfmZrzkirds8fDWklFE=
 github.com/tinylib/msgp v1.1.0/go.mod h1:+d+yLhGm8mzTaHzB+wgMYrodPfmZrzkirds8fDWklFE=
 github.com/tinylib/msgp v1.1.2/go.mod h1:+d+yLhGm8mzTaHzB+wgMYrodPfmZrzkirds8fDWklFE=
-github.com/wchen99998/torrent v0.0.0-20260509181054-a12440c4504e h1:HtkcKcTKNsSWceq0DFtAsxXLVC4NvBTrpBVZNIsZah8=
-github.com/wchen99998/torrent v0.0.0-20260509181054-a12440c4504e/go.mod h1:jO4iUWF8X/pbQOrZxVMou8RKRDOWKIn/FFG6X0CRd5c=
+github.com/wchen99998/dht/v2 v2.24.2 h1:D94uuhyg4tSQlWoBapJlXs4yszucB5J/i5EtKa21lSA=
+github.com/wchen99998/dht/v2 v2.24.2/go.mod h1:pghmI39D0rGDmRdCVhj+4p7K8LFsm8mAP2XvZXPMFUc=
+github.com/wchen99998/torrent v1.54.2 h1:7021Xl5KkAcRzoaQi93QEG3ceoA3i6tIStrb9bdxsIc=
+github.com/wchen99998/torrent v1.54.2/go.mod h1:7DqvTC01CVdK3k4fX+gQ9vGDPJzPJ4D6fdAiQffutpQ=
 github.com/willf/bitset v1.1.9/go.mod h1:RjeCKbqT1RxIR/KWY6phxZiaY1IyutSBfGjNPySAYV4=
 github.com/willf/bitset v1.1.10/go.mod h1:RjeCKbqT1RxIR/KWY6phxZiaY1IyutSBfGjNPySAYV4=
 github.com/wlynxg/anet v0.0.3 h1:PvR53psxFXstc12jelG6f1Lv4MWqE0tI76/hHGjh9rg=

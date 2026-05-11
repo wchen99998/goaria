@@ -65,6 +65,21 @@
       "maxItems": 8,
       "items": { "$ref": "#/$defs/uri" }
     },
+    "torrentSource": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "maxLength": 1048576
+        },
+        {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://",
+          "maxLength": 2048
+        }
+      ]
+    },
     "stringList": {
       "type": "array",
       "maxItems": 64,
@@ -108,8 +123,10 @@
         "goaria-disable-utp": { "$ref": "#/$defs/boolString" },
         "goaria-listen-host": { "type": "string", "maxLength": 256 },
         "goaria-peer-addrs": { "$ref": "#/$defs/stringList" },
+        "goaria-max-torrent-size": { "$ref": "#/$defs/sizeString" },
         "goaria-torrent-max-active-files": { "$ref": "#/$defs/nonNegativeString" },
         "goaria-torrent-readahead": { "$ref": "#/$defs/sizeString" },
+        "goaria-torrent-source-url": { "type": "string", "format": "uri", "maxLength": 2048 },
         "header": { "$ref": "#/$defs/stringList" },
         "http-accept-gzip": { "$ref": "#/$defs/boolString" },
         "http-auth-challenge": { "$ref": "#/$defs/boolString" },
@@ -124,6 +141,7 @@
         "https-proxy-passwd": { "type": "string", "maxLength": 256 },
         "https-proxy-user": { "type": "string", "maxLength": 256 },
         "index-out": { "$ref": "#/$defs/stringList" },
+        "load-cookies": { "type": "string", "maxLength": 4096 },
         "lowest-speed-limit": { "$ref": "#/$defs/nonNegativeString" },
         "listen-port": { "$ref": "#/$defs/nonNegativeString" },
         "max-concurrent-downloads": { "$ref": "#/$defs/nonNegativeString" },
@@ -210,7 +228,7 @@
                   "minItems": 2,
                   "maxItems": 4,
                   "prefixItems": [
-                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/torrentSource" },
                     { "$ref": "#/$defs/uriList" },
                     { "$ref": "#/$defs/options" },
                     { "$ref": "#/$defs/position" }
@@ -221,7 +239,7 @@
                   "minItems": 1,
                   "maxItems": 3,
                   "prefixItems": [
-                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/torrentSource" },
                     { "$ref": "#/$defs/options" },
                     { "$ref": "#/$defs/position" }
                   ]
@@ -232,7 +250,7 @@
                   "maxItems": 5,
                   "prefixItems": [
                     { "$ref": "#/$defs/token" },
-                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/torrentSource" },
                     { "$ref": "#/$defs/uriList" },
                     { "$ref": "#/$defs/options" },
                     { "$ref": "#/$defs/position" }
@@ -244,7 +262,7 @@
                   "maxItems": 4,
                   "prefixItems": [
                     { "$ref": "#/$defs/token" },
-                    { "type": "string", "maxLength": 1048576 },
+                    { "$ref": "#/$defs/torrentSource" },
                     { "$ref": "#/$defs/options" },
                     { "$ref": "#/$defs/position" }
                   ]

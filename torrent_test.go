@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -58,6 +61,135 @@ func TestAddTorrentParsesRealTestTorrent(t *testing.T) {
 	}
 	if status["totalLength"] == "0" || status["pieceLength"] == "0" || status["numPieces"] == "0" {
 		t.Fatalf("incomplete torrent metadata: %#v", status)
+	}
+}
+
+func TestAddTorrentFetchesHTTPURLWithWebseedsAndPersistsBytes(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, _, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantInfoHash := mi.HashInfoBytes().HexString()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect.torrent":
+			cookie := r.Header.Get("Cookie")
+			if !strings.Contains(cookie, "redirect=only") {
+				http.Error(w, "missing redirect cookie", http.StatusUnauthorized)
+				return
+			}
+			if strings.Contains(cookie, "session=ok") {
+				http.Error(w, "final-path cookie leaked to redirect", http.StatusBadRequest)
+				return
+			}
+			http.Redirect(w, r, "/file.torrent", http.StatusFound)
+		case "/file.torrent":
+			if got := r.Header.Get("Authorization"); got != "Bearer token" {
+				http.Error(w, "missing authorization", http.StatusUnauthorized)
+				return
+			}
+			if got := r.UserAgent(); got != "goaria-client/1.0" {
+				http.Error(w, "missing user agent", http.StatusBadRequest)
+				return
+			}
+			if got := r.Header.Get("Cookie"); !strings.Contains(got, "session=ok") {
+				http.Error(w, "missing cookie", http.StatusUnauthorized)
+				return
+			} else if strings.Contains(got, "redirect=only") {
+				http.Error(w, "redirect cookie leaked to final URL", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-bittorrent")
+			_, _ = w.Write(data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookieDomain := parsed.Hostname()
+	dir := t.TempDir()
+	cookiePath := filepath.Join(dir, "cookies.txt")
+	cookieData := cookieDomain + "\tFALSE\t/redirect.torrent\tFALSE\t0\tredirect\tonly\n" +
+		cookieDomain + "\tFALSE\t/file.torrent\tFALSE\t0\tsession\tok\n"
+	if err := os.WriteFile(cookiePath, []byte(cookieData), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sessionPath := filepath.Join(dir, "goaria.session")
+	engine, err := NewEngine(Config{Dir: dir, SaveSession: sessionPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceURL := server.URL + "/redirect.torrent"
+	webseed := "https://cdn.example.com/payload-file"
+	gid, err := engine.AddTorrent(sourceURL, []string{webseed}, Options{
+		"pause":        "true",
+		"header":       []string{"Authorization: Bearer token"},
+		"user-agent":   "goaria-client/1.0",
+		"load-cookies": cookiePath,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := engine.TellStatus(gid, []string{"status", "infoHash", "bittorrent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != string(StatusPaused) || status["infoHash"] != wantInfoHash {
+		t.Fatalf("status = %#v, want paused torrent %s", status, wantInfoHash)
+	}
+	uris, err := engine.GetURIs(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uris) != 1 || uris[0].URI != webseed {
+		t.Fatalf("torrent webseeds = %#v, want only %q", uris, webseed)
+	}
+	opts, err := engine.GetOption(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts["goaria-torrent-source-url"] != sourceURL {
+		t.Fatalf("source URL option = %#v, want %q", opts["goaria-torrent-source-url"], sourceURL)
+	}
+	if err := engine.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionData, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := string(sessionData)
+	if !strings.Contains(session, sessionTorrentDataURIPrefix) {
+		t.Fatalf("session did not store fetched torrent bytes:\n%s", session)
+	}
+	if strings.Contains(strings.SplitN(session, "\n", 2)[0], sourceURL) {
+		t.Fatalf("session URI line depends on source URL:\n%s", session)
+	}
+
+	server.Close()
+	restored, err := NewEngine(Config{Dir: dir, InputFile: sessionPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close(context.Background())
+	restoredStatus, err := restored.TellStatus(gid, []string{"status", "infoHash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restoredStatus["status"] != string(StatusPaused) || restoredStatus["infoHash"] != wantInfoHash {
+		t.Fatalf("restored status = %#v, want paused torrent %s", restoredStatus, wantInfoHash)
 	}
 }
 
@@ -351,11 +483,17 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 		t.Fatal("index-out should install a custom path maker")
 	}
 	upverted := info.UpvertedFiles()
-	gotPath := maker(storage.FilePathMakerOpts{Info: &info, File: &upverted[0]})
+	gotPath, err := maker(storage.FilePathMakerOpts{Info: &info, File: &upverted[0], FileIndex: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if gotPath != "custom-alpha.txt" {
 		t.Fatalf("custom path = %q, want custom-alpha.txt", gotPath)
 	}
-	gotPath = maker(storage.FilePathMakerOpts{Info: &info, File: &upverted[1]})
+	gotPath, err = maker(storage.FilePathMakerOpts{Info: &info, File: &upverted[1], FileIndex: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if gotPath != filepath.Join(info.BestName(), "nested", "beta.txt") {
 		t.Fatalf("default path = %q", gotPath)
 	}
@@ -536,6 +674,56 @@ func TestAddTorrentAndMagnetRejectInvalidInputs(t *testing.T) {
 	}
 	if _, err := closed.AddURI([]string{magnet}, Options{"pause": "true"}, nil); !errors.Is(err, ErrShutdown) {
 		t.Fatalf("AddURI magnet after Close error = %v, want ErrShutdown", err)
+	}
+}
+
+func TestAddTorrentURLRejectsInvalidMetadataWithoutAddingDownload(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("not a torrent"))
+	}))
+	defer server.Close()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	const gid = "2222222222222222"
+	if _, err := engine.AddTorrent(server.URL+"/file.torrent", nil, Options{"gid": gid, "pause": "true"}, nil); err == nil {
+		t.Fatal("AddTorrent accepted URL with invalid torrent metadata")
+	}
+	if _, err := engine.TellStatus(gid, []string{"status"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("TellStatus after rejected torrent = %v, want ErrNotFound", err)
+	}
+}
+
+func TestAddTorrentURLEnforcesMaxTorrentSize(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	const gid = "3333333333333333"
+	if _, err := engine.AddTorrent(server.URL+"/file.torrent", nil, Options{
+		"gid":                     gid,
+		"pause":                   "true",
+		"goaria-max-torrent-size": "8",
+	}, nil); err == nil {
+		t.Fatal("AddTorrent accepted oversized torrent metadata response")
+	}
+	if _, err := engine.TellStatus(gid, []string{"status"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("TellStatus after oversized torrent = %v, want ErrNotFound", err)
 	}
 }
 

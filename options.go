@@ -37,6 +37,7 @@ func defaultOptions(dir string, maxConcurrent, maxResult int) Options {
 		"follow-torrent":             "false",
 		"lowest-speed-limit":         "0",
 		"max-file-not-found":         "0",
+		"goaria-max-torrent-size":    "16M",
 		"max-tries":                  "5",
 		"retry-wait":                 "0",
 		"connect-timeout":            "60",

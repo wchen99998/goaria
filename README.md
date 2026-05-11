@@ -120,13 +120,14 @@ The aria2 JSON-RPC method surface is implemented:
 - `system.listMethods`
 - `system.listNotifications`
 
-`aria2.addTorrent` accepts base64 `.torrent` payloads, `aria2.addUri` accepts BitTorrent magnet URIs, and torrent status exposes `infoHash`, `numSeeders`, `seeder`, `bittorrent`, torrent file metadata, and peer data. HTTP and HTTPS transfers use ranged segmented downloads when the server supports byte ranges. `aria2.addMetalink` remains explicitly unsupported.
+`aria2.addTorrent` accepts base64 `.torrent` payloads and HTTP/S `.torrent` URLs, `aria2.addUri` accepts BitTorrent magnet URIs, and torrent status exposes `infoHash`, `numSeeders`, `seeder`, `bittorrent`, torrent file metadata, and peer data. HTTP and HTTPS transfers use ranged segmented downloads when the server supports byte ranges. `aria2.addMetalink` remains explicitly unsupported.
 
 ## BitTorrent Coverage
 
 Implemented BitTorrent behaviors include:
 
 - base64 `.torrent` uploads via `aria2.addTorrent`
+- HTTP/S `.torrent` URL fetching via `aria2.addTorrent`, persisted as fetched torrent bytes in sessions
 - magnet registration through `aria2.addUri`
 - webseed URI forwarding from the `aria2.addTorrent` URI parameter
 - selected file downloads through `select-file`

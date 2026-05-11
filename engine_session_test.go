@@ -84,6 +84,28 @@ func TestSessionAutoSaveAndLoadPausedDownload(t *testing.T) {
 	}
 }
 
+func TestParseSessionAcceptsDefaultMaxTorrentDataURI(t *testing.T) {
+	data := bytes.Repeat([]byte{0x42}, defaultMaxTorrentSize)
+	line := encodeSessionTorrentDataURI(data) + "\n  pause=true\n"
+	if len(line) > sessionMaxLineSize {
+		t.Fatalf("test line length %d exceeds sessionMaxLineSize %d", len(line), sessionMaxLineSize)
+	}
+	items, err := parseSession(strings.NewReader(line))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || len(items[0].uris) != 1 {
+		t.Fatalf("parsed session items = %#v", items)
+	}
+	decoded, ok, err := decodeSessionTorrentDataURI(items[0].uris[0])
+	if err != nil || !ok {
+		t.Fatalf("decode session torrent URI ok=%v err=%v", ok, err)
+	}
+	if len(decoded) != defaultMaxTorrentSize {
+		t.Fatalf("decoded torrent size = %d, want %d", len(decoded), defaultMaxTorrentSize)
+	}
+}
+
 func TestSessionPreservesTorrentDownloads(t *testing.T) {
 	data, err := os.ReadFile("test.torrent")
 	if err != nil {

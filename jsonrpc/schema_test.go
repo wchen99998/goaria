@@ -62,7 +62,9 @@ func TestJSONRPCSchemaAcceptsKnownRequests(t *testing.T) {
 	for _, example := range []string{
 		`{"jsonrpc":"2.0","id":"1","method":"aria2.addUri","params":[["https://example.com/file"],{"out":"file"}]}`,
 		`{"jsonrpc":"2.0","id":"torrent","method":"aria2.addTorrent","params":["ZHVtbXk",{"pause":"true"},0]}`,
+		`{"jsonrpc":"2.0","id":"torrent-url","method":"aria2.addTorrent","params":["https://example.com/file.torrent",{"pause":"true","header":["Authorization: Bearer token"],"goaria-max-torrent-size":"16M"},0]}`,
 		`{"jsonrpc":"2.0","id":"torrent-webseed","method":"aria2.addTorrent","params":["ZHVtbXk",["https://example.com/webseed"],{"pause":"true"},0]}`,
+		`{"jsonrpc":"2.0","id":"torrent-url-webseed","method":"aria2.addTorrent","params":["https://example.com/file.torrent",["https://cdn.example.com/payload-file"],{"pause":"true","user-agent":"goaria-client/1.0","load-cookies":"/tmp/cookies.txt"},0]}`,
 		`{"jsonrpc":"2.0","id":"torrent-token-options","method":"aria2.addTorrent","params":["token:secret","ZHVtbXk",{"pause":"true"},0]}`,
 		`{"jsonrpc":"2.0","id":"2","method":"aria2.tellStatus","params":["token:secret","0123456789abcdef",["gid","status"]]}`,
 		`{"jsonrpc":"2.0","id":"3","method":"system.multicall","params":[[{"methodName":"system.listMethods","params":[]}]]}`,

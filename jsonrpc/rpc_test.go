@@ -189,6 +189,54 @@ func TestRPCAddTorrentWithRealTorrentMetadata(t *testing.T) {
 	}
 }
 
+func TestRPCAddTorrentAcceptsTorrentURLSource(t *testing.T) {
+	data, err := os.ReadFile("../test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-bittorrent")
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	rpc := NewHandler(engine, "")
+
+	webseed := "https://cdn.example.com/payload-file"
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "torrent-url",
+		"method":  "aria2.addTorrent",
+		"params": []any{
+			server.URL + "/file.torrent",
+			[]string{webseed},
+			map[string]any{"pause": "true", "gid": "4444444444444444"},
+			0,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := invokeRPC(t, rpc, string(payload))
+	if resp.Error != nil {
+		t.Fatalf("addTorrent URL failed: %#v", resp.Error)
+	}
+	if resp.Result != "4444444444444444" {
+		t.Fatalf("gid = %#v, want 4444444444444444", resp.Result)
+	}
+	uris, err := engine.GetURIs("4444444444444444")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uris) != 1 || uris[0].URI != webseed {
+		t.Fatalf("torrent webseeds = %#v, want only %q", uris, webseed)
+	}
+}
+
 func TestRPCAddTorrentAria2CompatibleParamShapes(t *testing.T) {
 	data, err := os.ReadFile("../test.torrent")
 	if err != nil {

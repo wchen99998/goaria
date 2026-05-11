@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	sessionMaxLineSize          = 4 * 1024 * 1024
 	sessionTorrentDataURIPrefix = "data:application/x-bittorrent;base64,"
+	sessionMaxLineSize          = len(sessionTorrentDataURIPrefix) + ((defaultMaxTorrentSize+2)/3)*4 + 1<<20
 )
 
 type sessionDownload struct {

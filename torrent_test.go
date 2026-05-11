@@ -547,6 +547,24 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if err := applyTorrentClientIdentityOptions(torrent.NewDefaultClientConfig(), Options{"goaria-torrent-peer-profile": "bad"}); err == nil {
 		t.Fatal("accepted invalid torrent peer profile")
 	}
+	discoveryCfg := torrent.NewDefaultClientConfig()
+	applyTorrentPeerDiscoveryOptions(discoveryCfg, Options{}, true)
+	if !discoveryCfg.NoDHT || !discoveryCfg.DisablePEX || discoveryCfg.DisableTrackers {
+		t.Fatalf("private torrent discovery defaults = NoDHT:%v DisablePEX:%v DisableTrackers:%v, want true true false", discoveryCfg.NoDHT, discoveryCfg.DisablePEX, discoveryCfg.DisableTrackers)
+	}
+	discoveryCfg = torrent.NewDefaultClientConfig()
+	applyTorrentPeerDiscoveryOptions(discoveryCfg, Options{
+		"goaria-disable-dht": "false",
+		"goaria-disable-pex": "false",
+	}, true)
+	if discoveryCfg.NoDHT || discoveryCfg.DisablePEX {
+		t.Fatalf("explicit private discovery overrides not applied: NoDHT:%v DisablePEX:%v", discoveryCfg.NoDHT, discoveryCfg.DisablePEX)
+	}
+	discoveryCfg = torrent.NewDefaultClientConfig()
+	applyTorrentPeerDiscoveryOptions(discoveryCfg, Options{"goaria-disable-pex": "true"}, false)
+	if !discoveryCfg.DisablePEX {
+		t.Fatal("goaria-disable-pex was not applied")
+	}
 	engine, err := NewEngine(Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)

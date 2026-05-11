@@ -521,6 +521,25 @@ func applyTorrentClientIdentityOptions(cfg *torrent.ClientConfig, opts Options) 
 	return nil
 }
 
+func torrentInfoPrivate(info metainfo.Info) bool {
+	return info.Private != nil && *info.Private
+}
+
+func applyTorrentPeerDiscoveryOptions(cfg *torrent.ClientConfig, opts Options, privateTorrent bool) {
+	cfg.NoDHT = optionBool(opts, "goaria-disable-dht")
+	cfg.DisableTrackers = optionBool(opts, "goaria-disable-trackers")
+	cfg.DisablePEX = optionBool(opts, "goaria-disable-pex")
+	if !privateTorrent {
+		return
+	}
+	if !optionExplicit(opts, "goaria-disable-dht") {
+		cfg.NoDHT = true
+	}
+	if !optionExplicit(opts, "goaria-disable-pex") {
+		cfg.DisablePEX = true
+	}
+}
+
 func (e *Engine) runTorrentDownload(d *Download) error {
 	d.mu.RLock()
 	ctx := d.ctx
@@ -532,6 +551,20 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	d.mu.RUnlock()
 	if ctx == nil {
 		return context.Canceled
+	}
+	var mi *metainfo.MetaInfo
+	privateTorrent := false
+	if magnet == "" {
+		var err error
+		mi, err = metainfo.Load(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		info, err := mi.UnmarshalInfo()
+		if err != nil {
+			return err
+		}
+		privateTorrent = torrentInfoPrivate(info)
 	}
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = dir
@@ -551,8 +584,7 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 		cfg.NoUpload = true
 	}
 	cfg.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg.NoDHT = optionBool(opts, "goaria-disable-dht")
-	cfg.DisableTrackers = optionBool(opts, "goaria-disable-trackers")
+	applyTorrentPeerDiscoveryOptions(cfg, opts, privateTorrent)
 	cfg.DisableUTP = optionBool(opts, "disable-utp") || optionBool(opts, "goaria-disable-utp")
 	cfg.DisableIPv6 = optionBool(opts, "disable-ipv6")
 	if maxPeers := optionInt(opts, "bt-max-peers", 0); maxPeers > 0 {
@@ -582,10 +614,6 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 		applyTorrentTrackerOptions(spec, opts)
 		tor, _, err = cl.AddTorrentSpec(spec)
 	} else {
-		mi, err := metainfo.Load(bytes.NewReader(data))
-		if err != nil {
-			return err
-		}
 		spec, err := torrent.TorrentSpecFromMetaInfoErr(mi)
 		if err != nil {
 			return err

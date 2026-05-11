@@ -34,6 +34,7 @@ fuzz:
 	go test -run '^$$' -fuzz=FuzzBuildGETPayload -fuzztime=15s ./jsonrpc
 	go test -run '^$$' -fuzz=FuzzOptionsAndSizes -fuzztime=15s .
 	go test -run '^$$' -fuzz=FuzzPathsAndBitfield -fuzztime=15s .
+	go test -run '^$$' -fuzz=FuzzTorrentOptionsSelectionAndPaths -fuzztime=15s .
 	go test -run '^$$' -fuzz=FuzzAddTorrentMetadata -fuzztime=15s .
 
 fuzz-hour:
@@ -45,6 +46,7 @@ fuzz-hour:
 	go test -run '^$$' -fuzz=FuzzBuildGETPayload -fuzztime=1h ./jsonrpc
 	go test -run '^$$' -fuzz=FuzzOptionsAndSizes -fuzztime=1h .
 	go test -run '^$$' -fuzz=FuzzPathsAndBitfield -fuzztime=1h .
+	go test -run '^$$' -fuzz=FuzzTorrentOptionsSelectionAndPaths -fuzztime=1h .
 	go test -run '^$$' -fuzz=FuzzAddTorrentMetadata -fuzztime=1h .
 
 build:

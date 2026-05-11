@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"testing"
 
 	"github.com/wchen99998/goaria"
@@ -44,6 +45,16 @@ func FuzzJSONRPCOverHTTPChunks(f *testing.F) {
 		`not-json`,
 	} {
 		f.Add(seed, uint8(1))
+	}
+	if data, err := os.ReadFile("../test.torrent"); err == nil {
+		encoded := base64.StdEncoding.EncodeToString(data)
+		for _, payload := range []string{
+			`{"jsonrpc":"2.0","id":"torrent-options","method":"aria2.addTorrent","params":["token:fuzz-secret","` + encoded + `",{"pause":"true","gid":"2000000000000001"}]}`,
+			`{"jsonrpc":"2.0","id":"torrent-webseed","method":"aria2.addTorrent","params":["token:fuzz-secret","` + encoded + `",["http://example.invalid/webseed"],{"pause":"true","gid":"2000000000000002"},0]}`,
+			`{"jsonrpc":"2.0","id":"torrent-bad-shape","method":"aria2.addTorrent","params":["token:fuzz-secret","` + encoded + `","not-uri-list-or-options"]}`,
+		} {
+			f.Add(payload, uint8(7))
+		}
 	}
 
 	engine, err := goaria.NewEngine(goaria.Config{Dir: f.TempDir()})

@@ -189,6 +189,103 @@ func TestRPCAddTorrentWithRealTorrentMetadata(t *testing.T) {
 	}
 }
 
+func TestRPCAddTorrentAria2CompatibleParamShapes(t *testing.T) {
+	data, err := os.ReadFile("../test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	webseed := "http://example.invalid/webseed"
+
+	for _, tt := range []struct {
+		name   string
+		secret string
+		params []any
+		gid    string
+	}{
+		{
+			name:   "torrent and options",
+			params: []any{encoded, map[string]any{"pause": "true", "gid": "1000000000000001"}},
+			gid:    "1000000000000001",
+		},
+		{
+			name:   "torrent uris options position",
+			params: []any{encoded, []string{webseed}, map[string]any{"pause": "true", "gid": "1000000000000002"}, 0},
+			gid:    "1000000000000002",
+		},
+		{
+			name:   "token torrent options position",
+			secret: "secret",
+			params: []any{"token:secret", encoded, map[string]any{"pause": "true", "gid": "1000000000000003"}, 0},
+			gid:    "1000000000000003",
+		},
+		{
+			name:   "token torrent uris options position",
+			secret: "secret",
+			params: []any{"token:secret", encoded, []string{webseed}, map[string]any{"pause": "true", "gid": "1000000000000004"}, 0},
+			gid:    "1000000000000004",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close(context.Background())
+			rpc := NewHandler(engine, tt.secret)
+
+			payload, err := json.Marshal(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      "add",
+				"method":  "aria2.addTorrent",
+				"params":  tt.params,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp := invokeRPC(t, rpc, string(payload))
+			if resp.Error != nil {
+				t.Fatalf("addTorrent failed: %#v", resp.Error)
+			}
+			var gotGID string
+			raw, _ := json.Marshal(resp.Result)
+			if err := json.Unmarshal(raw, &gotGID); err != nil {
+				t.Fatal(err)
+			}
+			if gotGID != tt.gid {
+				t.Fatalf("gid = %q, want %q", gotGID, tt.gid)
+			}
+			status, err := engine.TellStatus(gotGID, []string{"status"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status["status"] != string(goaria.StatusPaused) {
+				t.Fatalf("status = %v, want paused", status["status"])
+			}
+		})
+	}
+
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	rpc := NewHandler(engine, "")
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "bad",
+		"method":  "aria2.addTorrent",
+		"params":  []any{encoded, "not-uri-list-or-options"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := invokeRPC(t, rpc, string(payload))
+	if resp.Error == nil || resp.Error.Code != rpcInvalidParams {
+		t.Fatalf("bad addTorrent params response = %#v", resp)
+	}
+}
+
 func TestServerCustomPathAndMountableHandler(t *testing.T) {
 	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
 	if err != nil {

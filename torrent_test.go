@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,7 @@ import (
 	"github.com/wchen99998/torrent"
 	"github.com/wchen99998/torrent/bencode"
 	"github.com/wchen99998/torrent/metainfo"
+	"github.com/wchen99998/torrent/storage"
 )
 
 func TestAddTorrentParsesRealTestTorrent(t *testing.T) {
@@ -151,6 +153,396 @@ func TestTorrentStreamHandlerWithTestTorrent(t *testing.T) {
 	}
 }
 
+func TestTorrentDownloadWithoutStreamHandlerUsesLocalSeeder(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, info, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadDir := t.TempDir()
+	payloads := writeTestTorrentPayload(t, payloadDir, info)
+	peerAddrs, stopSeeder := startSeederForMetaInfo(t, payloadDir, mi)
+	defer stopSeeder()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+		"select-file":             "2",
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+		"goaria-peer-addrs":       peerAddrs,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("GetFiles returned %d files, want 2", len(files))
+	}
+	if files[1].CompletedLength != files[1].Length || files[1].Selected != "true" {
+		t.Fatalf("selected file did not complete: %#v", files[1])
+	}
+	got, err := os.ReadFile(files[1].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payloads[2]) {
+		t.Fatalf("downloaded payload mismatch: got %q want %q", got, payloads[2])
+	}
+}
+
+func TestTorrentCompletesWhenNoFilesAreSelected(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+		"select-file":             "not-a-number",
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	status, err := engine.TellStatus(gid, []string{"totalLength", "completedLength"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["totalLength"] != "0" || status["completedLength"] != "0" {
+		t.Fatalf("empty selection status = %#v", status)
+	}
+}
+
+func TestTorrentOptionParsingAndHelpers(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, info, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	rawEncoded := strings.TrimRight(encoded, "=")
+	for _, input := range []string{encoded, rawEncoded} {
+		got, err := decodeTorrentParam(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatal("decoded torrent did not round-trip")
+		}
+	}
+	if _, err := decodeTorrentParam("not base64!"); err == nil {
+		t.Fatal("decodeTorrentParam accepted invalid base64")
+	}
+	if _, _, err := torrentMetaInfo([]byte("d4:info3:bade")); err == nil {
+		t.Fatal("torrentMetaInfo accepted invalid info payload")
+	}
+	reencoded, err := encodeMetaInfo(*mi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTrip, err := decodeTorrentParam(reencoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roundTripMI, _, err := torrentMetaInfo(roundTrip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roundTripMI.HashInfoBytes() != mi.HashInfoBytes() {
+		t.Fatalf("encoded metainfo hash = %s, want %s", roundTripMI.HashInfoBytes(), mi.HashInfoBytes())
+	}
+
+	for input, want := range map[string]string{
+		"":                        "torrent",
+		"../escape/./file.txt":    filepath.Join("escape", "file.txt"),
+		"root//nested/../../file": filepath.Join("root", "nested", "file"),
+		"/absolute/path/file.bin": filepath.Join("absolute", "path", "file.bin"),
+	} {
+		if got := safeTorrentRelPath(input); got != want {
+			t.Fatalf("safeTorrentRelPath(%q) = %q, want %q", input, got, want)
+		}
+	}
+
+	selected := selectedFileSet(5, "2, 4-5, bad, 7-6,")
+	for _, index := range []int{2, 4, 5} {
+		if !selected[index] {
+			t.Fatalf("selectedFileSet missing index %d: %#v", index, selected)
+		}
+	}
+	if selected[1] || selected[3] || selected[6] {
+		t.Fatalf("selectedFileSet selected unexpected indexes: %#v", selected)
+	}
+	if all := selectedFileSet(1, "999"); !all[1] || len(all) != 1 {
+		t.Fatalf("single-file selection should select the only file: %#v", all)
+	}
+
+	indexOut, err := parseIndexOut(Options{"index-out": []string{"2=renamed.txt", "3= nested/ok.txt "}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if indexOut[2] != "renamed.txt" || indexOut[3] != "nested/ok.txt" {
+		t.Fatalf("parseIndexOut = %#v", indexOut)
+	}
+	for _, opts := range []Options{
+		{"index-out": "missing-separator"},
+		{"index-out": "0=file.txt"},
+		{"index-out": "x=file.txt"},
+		{"index-out": "1= "},
+	} {
+		if _, err := parseIndexOut(opts); err == nil {
+			t.Fatalf("parseIndexOut(%#v) succeeded, want error", opts)
+		}
+	}
+	if _, _, err := torrentSelectionAndIndexOut(info, Options{"select-file": "1-2", "index-out": "2=renamed.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []Options{
+		{"select-file": "999"},
+		{"index-out": "999=missing.txt"},
+	} {
+		if _, _, err := torrentSelectionAndIndexOut(info, opts); err == nil {
+			t.Fatalf("torrentSelectionAndIndexOut(%#v) succeeded, want error", opts)
+		}
+	}
+
+	spec := &torrent.TorrentSpec{Trackers: [][]string{{"udp://one", "udp://two"}, {"http://keep"}}}
+	applyTorrentTrackerOptions(spec, Options{
+		"bt-exclude-tracker": "udp://one",
+		"bt-tracker":         "udp://new, http://new2",
+	})
+	if len(spec.Trackers) != 3 || len(spec.Trackers[0]) != 1 || spec.Trackers[0][0] != "udp://two" || spec.Trackers[2][0] != "udp://new" || spec.Trackers[2][1] != "http://new2" {
+		t.Fatalf("tracker options produced %#v", spec.Trackers)
+	}
+	spec = &torrent.TorrentSpec{Trackers: [][]string{{"udp://one"}, {"http://keep"}}}
+	applyTorrentTrackerOptions(spec, Options{"bt-exclude-tracker": "*"})
+	if len(spec.Trackers) != 0 {
+		t.Fatalf("exclude all trackers produced %#v", spec.Trackers)
+	}
+
+	if maker := torrentFilePathMaker(nil); maker != nil {
+		t.Fatal("nil index-out should not install a custom path maker")
+	}
+	maker := torrentFilePathMaker(Options{"index-out": []string{"1=../custom-alpha.txt"}})
+	if maker == nil {
+		t.Fatal("index-out should install a custom path maker")
+	}
+	upverted := info.UpvertedFiles()
+	gotPath := maker(storage.FilePathMakerOpts{Info: &info, File: &upverted[0]})
+	if gotPath != "custom-alpha.txt" {
+		t.Fatalf("custom path = %q, want custom-alpha.txt", gotPath)
+	}
+	gotPath = maker(storage.FilePathMakerOpts{Info: &info, File: &upverted[1]})
+	if gotPath != filepath.Join(info.BestName(), "nested", "beta.txt") {
+		t.Fatalf("default path = %q", gotPath)
+	}
+	states := torrentFileStates(info, Options{"index-out": "2=custom-beta.txt"}, t.TempDir(), nil)
+	if filepath.Base(states[1].Path) != "custom-beta.txt" {
+		t.Fatalf("index-out torrent state path = %q", states[1].Path)
+	}
+
+	if got := peerBitfield(0, 8); got != "" {
+		t.Fatalf("empty peer bitfield = %q", got)
+	}
+	if got := peerBitfield(3, 10); got != "e000" {
+		t.Fatalf("partial peer bitfield = %q, want e000", got)
+	}
+	if got := peerBitfield(99, 10); got != "ffc0" {
+		t.Fatalf("capped peer bitfield = %q, want ffc0", got)
+	}
+	if _, err := newMagnetDownload("gid", "magnet:?xt=urn:btih:not-a-hash", nil); err == nil {
+		t.Fatal("newMagnetDownload accepted invalid magnet")
+	}
+	if d := newTorrentDownload("gid", nil, "", nil, Options{}, nil, metainfo.Info{}); d.dir != "." {
+		t.Fatalf("empty torrent options dir = %q, want .", d.dir)
+	}
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	if err := engine.runTorrentDownload(&Download{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("runTorrentDownload with nil context = %v, want context.Canceled", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceledMagnet := newTorrentDownload("gid", nil, magnetFixtureURI(), nil, Options{
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+	}, nil, metainfo.Info{Name: "fixture"})
+	canceledMagnet.ctx = ctx
+	if err := engine.runTorrentDownload(canceledMagnet); !errors.Is(err, context.Canceled) {
+		t.Fatalf("runTorrentDownload with canceled magnet = %v, want context.Canceled", err)
+	}
+	invalidMagnet := newTorrentDownload("gid", nil, "magnet:?xt=urn:btih:not-a-hash", nil, Options{}, nil, metainfo.Info{})
+	invalidMagnet.ctx = context.Background()
+	if err := engine.runTorrentDownload(invalidMagnet); err == nil {
+		t.Fatal("runTorrentDownload accepted invalid magnet")
+	}
+	invalidTorrent := newTorrentDownload("gid", []byte("not a torrent"), "", nil, Options{}, nil, metainfo.Info{})
+	invalidTorrent.ctx = context.Background()
+	if err := engine.runTorrentDownload(invalidTorrent); err == nil {
+		t.Fatal("runTorrentDownload accepted invalid torrent data")
+	}
+	badListenHost := newTorrentDownload("gid", data, "", nil, Options{"goaria-listen-host": "bad host"}, mi, info)
+	badListenHost.ctx = context.Background()
+	if err := engine.runTorrentDownload(badListenHost); err == nil {
+		t.Fatal("runTorrentDownload accepted invalid listen host")
+	}
+	if err := engine.processCompletedTorrentFiles(context.Background(), &Download{}, nil); err != nil {
+		t.Fatalf("processCompletedTorrentFiles with no files = %v", err)
+	}
+	cfg := torrent.NewDefaultClientConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.NoDHT = true
+	cfg.DisableTrackers = true
+	cfg.DisableUTP = true
+	cfg.NoDefaultPortForwarding = true
+	cfg.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cl, err := torrent.NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	tor, err := cl.AddTorrent(mi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-tor.GotInfo()
+	progressDownload := newTorrentDownload("gid", data, "", nil, Options{"dir": cfg.DataDir}, mi, info)
+	progressDownload.torrentFiles = append(progressDownload.torrentFiles, torrentFileState{Length: 1, Selected: true})
+	engine.updateTorrentProgress(progressDownload, tor)
+}
+
+func TestAddTorrentAndMagnetRejectInvalidInputs(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	magnet := magnetFixtureURI()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	for name, fn := range map[string]func() error{
+		"bad base64": func() error {
+			_, err := engine.AddTorrent("not base64!", nil, Options{"pause": "true"}, nil)
+			return err
+		},
+		"bad metainfo": func() error {
+			_, err := engine.AddTorrent(base64.StdEncoding.EncodeToString([]byte("not a torrent")), nil, Options{"pause": "true"}, nil)
+			return err
+		},
+		"bad webseed": func() error {
+			_, err := engine.AddTorrent(encoded, []string{"ftp://example.invalid/file"}, Options{"pause": "true"}, nil)
+			return err
+		},
+		"bad gid": func() error {
+			_, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "gid": "short"}, nil)
+			return err
+		},
+		"bad select-file": func() error {
+			_, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "select-file": "999"}, nil)
+			return err
+		},
+		"bad index-out": func() error {
+			_, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "index-out": "999=missing.txt"}, nil)
+			return err
+		},
+		"bad magnet": func() error {
+			_, err := engine.AddURI([]string{"magnet:?xt=urn:btih:not-a-hash"}, Options{"pause": "true"}, nil)
+			return err
+		},
+		"mixed magnet": func() error {
+			_, err := engine.AddURI([]string{magnet, "http://example.invalid/file"}, Options{"pause": "true"}, nil)
+			return err
+		},
+		"bad magnet gid": func() error {
+			_, err := engine.AddURI([]string{magnet}, Options{"pause": "true", "gid": "short"}, nil)
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := fn(); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+
+	if _, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "gid": "0123456789abcdef"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "gid": "0123456789abcdef"}, nil); err == nil {
+		t.Fatal("duplicate torrent gid succeeded")
+	}
+	if _, err := engine.AddURI([]string{magnet}, Options{"pause": "true", "gid": "1111111111111111"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.AddURI([]string{magnet}, Options{"pause": "true", "gid": "1111111111111111"}, nil); err == nil {
+		t.Fatal("duplicate magnet gid succeeded")
+	}
+	peers, err := engine.GetPeers("1111111111111111")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(peers) != 0 {
+		t.Fatalf("paused magnet peers = %#v, want empty", peers)
+	}
+	activeMagnet, err := engine.addMagnet(magnet, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ForceRemove(activeMagnet); err != nil {
+		t.Fatal(err)
+	}
+
+	closed, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := closed.AddTorrent(encoded, nil, Options{"pause": "true"}, nil); !errors.Is(err, ErrShutdown) {
+		t.Fatalf("AddTorrent after Close error = %v, want ErrShutdown", err)
+	}
+	if _, err := closed.AddURI([]string{magnet}, Options{"pause": "true"}, nil); !errors.Is(err, ErrShutdown) {
+		t.Fatalf("AddURI magnet after Close error = %v, want ErrShutdown", err)
+	}
+}
+
+func magnetFixtureURI() string {
+	return "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=fixture"
+}
+
 func writeTestTorrentPayload(t *testing.T, dir string, info metainfo.Info) map[int][]byte {
 	t.Helper()
 	payloads := make(map[int][]byte)
@@ -235,10 +627,12 @@ func TestTorrentMetadataOnlyAppliesTrackerOptions(t *testing.T) {
 	}
 	defer engine.Close(context.Background())
 
-	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), []string{"http://example.invalid/webseed"}, Options{
 		"bt-exclude-tracker": "http://plab.site/ann?uk=R841G0WjJy",
+		"bt-max-peers":       "8",
 		"bt-metadata-only":   "true",
 		"bt-tracker":         "http://127.0.0.1:1/announce",
+		"max-upload-limit":   "16K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -299,10 +693,11 @@ func TestTorrentStreamHandlerProcessesAndReleasesFiles(t *testing.T) {
 	defer engine.Close(context.Background())
 
 	gid, err := engine.AddTorrent(encoded, nil, Options{
-		"goaria-disable-dht":      "true",
-		"goaria-disable-trackers": "true",
-		"goaria-disable-utp":      "true",
-		"goaria-peer-addrs":       peerAddrs,
+		"goaria-disable-dht":              "true",
+		"goaria-disable-trackers":         "true",
+		"goaria-disable-utp":              "true",
+		"goaria-peer-addrs":               peerAddrs,
+		"goaria-torrent-max-active-files": "99",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -437,11 +832,19 @@ func TestTorrentStreamLeaseWaitsForExplicitReleaseAndBoundsActiveFiles(t *testin
 
 	first := receiveLease(t, leases, "first")
 	assertStatus(t, engine, gid, StatusActive)
+	peers, err := engine.GetPeers(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peers == nil {
+		t.Fatal("GetPeers returned nil for active torrent")
+	}
 	select {
 	case second := <-leases:
 		t.Fatalf("second lease %s started before first lease was released", second.Path)
 	case <-time.After(250 * time.Millisecond):
 	}
+	time.Sleep(1100 * time.Millisecond)
 	if err := first.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}

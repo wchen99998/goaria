@@ -37,6 +37,7 @@ type torrentFileState struct {
 	Path      string
 	Length    int64
 	Completed int64
+	Released  bool
 	Selected  bool
 	URIs      []URIInfo
 }
@@ -740,7 +741,7 @@ queue:
 			defer wg.Done()
 			defer func() { <-slots }()
 			item.file.Download()
-			if err := item.file.WaitComplete(ctx); err != nil {
+			if err := waitTorrentFileVerifiedComplete(ctx, item.file); err != nil {
 				item.file.SetPriority(torrent.PiecePriorityNone)
 				results <- err
 				return
@@ -776,6 +777,16 @@ func (e *Engine) handleCompletedTorrentFile(ctx context.Context, d *Download, it
 			} else {
 				finalizeErr = errors.Join(finalizeErr, item.file.ReleaseStorage())
 			}
+			d.mu.Lock()
+			if item.index >= 0 && item.index < len(d.torrentFiles) {
+				if discard {
+					d.torrentFiles[item.index].Released = false
+				} else if finalizeErr == nil {
+					d.torrentFiles[item.index].Released = true
+					d.torrentFiles[item.index].Completed = d.torrentFiles[item.index].Length
+				}
+			}
+			d.mu.Unlock()
 			if removeErr := os.Remove(item.state.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				finalizeErr = errors.Join(finalizeErr, removeErr)
 			}
@@ -820,6 +831,39 @@ func newLimitedReadCloser(r io.ReadCloser, n int64) *limitedReadCloser {
 		reader: io.LimitReader(r, n),
 		closer: r,
 	}
+}
+
+func waitTorrentFileVerifiedComplete(ctx context.Context, file *torrent.File) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if torrentFileVerifiedComplete(file) {
+			return nil
+		}
+		if err := file.WaitComplete(ctx); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func torrentFileVerifiedComplete(file *torrent.File) bool {
+	if file.Length() == 0 {
+		return true
+	}
+	for _, state := range file.State() {
+		if !state.Ok || !state.Complete {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *limitedReadCloser) Read(p []byte) (int, error) {
@@ -876,9 +920,14 @@ func (e *Engine) updateTorrentProgress(d *Download, tor *torrent.Torrent) int64 
 		if i >= len(files) {
 			continue
 		}
-		n := files[i].BytesCompleted()
-		if n > d.torrentFiles[i].Length {
+		var n int64
+		if d.torrentFiles[i].Released {
 			n = d.torrentFiles[i].Length
+		} else {
+			n = files[i].BytesCompleted()
+			if n > d.torrentFiles[i].Length {
+				n = d.torrentFiles[i].Length
+			}
 		}
 		d.torrentFiles[i].Completed = n
 		if d.torrentFiles[i].Selected {
@@ -901,25 +950,29 @@ func (d *Download) torrentPeersLocked() []map[string]string {
 		return []map[string]string{}
 	}
 	tor := d.torrent.torrent
-	conns := tor.PeerConns()
-	out := make([]map[string]string, 0, len(conns))
-	for _, pc := range conns {
-		host, port, err := net.SplitHostPort(pc.RemoteAddr.String())
+	snapshots := tor.PeerSnapshots()
+	out := make([]map[string]string, 0, len(snapshots))
+	for _, peer := range snapshots {
+		host, port, err := net.SplitHostPort(peer.RemoteAddr)
 		if err != nil {
-			host = pc.RemoteAddr.String()
+			host = peer.RemoteAddr
 			port = "0"
 		}
-		stats := pc.Stats()
+		stats := peer.Stats
+		bitfield := ""
+		if len(peer.RemoteBitfield) > 0 {
+			bitfield = hex.EncodeToString(peer.RemoteBitfield)
+		}
 		out = append(out, map[string]string{
-			"peerId":        url.QueryEscape(pc.PeerID.String()),
+			"peerId":        url.QueryEscape(peer.PeerID.String()),
 			"ip":            host,
 			"port":          port,
-			"bitfield":      peerBitfield(stats.RemotePieceCount, d.numPieces),
-			"amChoking":     "false",
-			"peerChoking":   "false",
+			"bitfield":      bitfield,
+			"amChoking":     strconv.FormatBool(peer.LocalChoking),
+			"peerChoking":   strconv.FormatBool(peer.RemoteChoking),
 			"downloadSpeed": strconv.FormatInt(int64(stats.DownloadRate), 10),
 			"uploadSpeed":   strconv.FormatInt(int64(stats.LastWriteUploadRate), 10),
-			"seeder":        strconv.FormatBool(int64(stats.RemotePieceCount) >= d.numPieces && d.numPieces > 0),
+			"seeder":        strconv.FormatBool(peer.Seeder),
 		})
 	}
 	return out

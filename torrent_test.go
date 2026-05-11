@@ -572,8 +572,14 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	}
 	<-tor.GotInfo()
 	progressDownload := newTorrentDownload("gid", data, "", nil, Options{"dir": cfg.DataDir}, mi, info)
-	progressDownload.torrentFiles = append(progressDownload.torrentFiles, torrentFileState{Length: 1, Selected: true})
 	engine.updateTorrentProgress(progressDownload, tor)
+	wantReleased := progressDownload.torrentFiles[0].Length
+	progressDownload.torrentFiles[0].Completed = wantReleased
+	progressDownload.torrentFiles[0].Released = true
+	engine.updateTorrentProgress(progressDownload, tor)
+	if progressDownload.torrentFiles[0].Completed != wantReleased || progressDownload.completedLen != wantReleased {
+		t.Fatalf("released torrent file progress regressed: file=%d total=%d", progressDownload.torrentFiles[0].Completed, progressDownload.completedLen)
+	}
 }
 
 func TestAddTorrentAndMagnetRejectInvalidInputs(t *testing.T) {

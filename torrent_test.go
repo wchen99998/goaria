@@ -517,6 +517,36 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if d := newTorrentDownload("gid", nil, "", nil, Options{}, nil, metainfo.Info{}); d.dir != "." {
 		t.Fatalf("empty torrent options dir = %q, want .", d.dir)
 	}
+	identityCfg := torrent.NewDefaultClientConfig()
+	if err := applyTorrentClientIdentityOptions(identityCfg, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if identityCfg.Bep20 != qBittorrentBep20Prefix {
+		t.Fatalf("default torrent Bep20 = %q, want %q", identityCfg.Bep20, qBittorrentBep20Prefix)
+	}
+	if identityCfg.HTTPUserAgent != qBittorrentPeerVisibleVersion {
+		t.Fatalf("default torrent user agent = %q, want %q", identityCfg.HTTPUserAgent, qBittorrentPeerVisibleVersion)
+	}
+	if identityCfg.ExtendedHandshakeClientVersion != qBittorrentPeerVisibleVersion {
+		t.Fatalf("default torrent client version = %q, want %q", identityCfg.ExtendedHandshakeClientVersion, qBittorrentPeerVisibleVersion)
+	}
+	identityCfg = torrent.NewDefaultClientConfig()
+	if err := applyTorrentClientIdentityOptions(identityCfg, Options{
+		"goaria-torrent-bep20-prefix":   "-XX0100-",
+		"goaria-torrent-client-version": "Client/1.0",
+		"goaria-torrent-user-agent":     "Client/1.0",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if identityCfg.Bep20 != "-XX0100-" || identityCfg.HTTPUserAgent != "Client/1.0" || identityCfg.ExtendedHandshakeClientVersion != "Client/1.0" {
+		t.Fatalf("torrent identity overrides not applied: prefix=%q ua=%q version=%q", identityCfg.Bep20, identityCfg.HTTPUserAgent, identityCfg.ExtendedHandshakeClientVersion)
+	}
+	if err := applyTorrentClientIdentityOptions(torrent.NewDefaultClientConfig(), Options{"goaria-torrent-bep20-prefix": strings.Repeat("x", 21)}); err == nil {
+		t.Fatal("accepted too-long torrent Bep20 prefix")
+	}
+	if err := applyTorrentClientIdentityOptions(torrent.NewDefaultClientConfig(), Options{"goaria-torrent-peer-profile": "bad"}); err == nil {
+		t.Fatal("accepted invalid torrent peer profile")
+	}
 	engine, err := NewEngine(Config{Dir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)

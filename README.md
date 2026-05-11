@@ -132,6 +132,7 @@ Implemented BitTorrent behaviors include:
 - webseed URI forwarding from the `aria2.addTorrent` URI parameter
 - selected file downloads through `select-file`
 - output path overrides through `index-out`
+- qBittorrent-like peer-visible identity by default for tracker user-agent, BEP20 peer ID prefix, and extended handshake version
 - `aria2.getFiles`, `aria2.getPeers`, `aria2.tellStatus`, and `aria2.getVersion` BitTorrent fields
 - embedded streaming with `Config.TorrentFileHandler`, explicit `TorrentFileLease.Release`/`Discard`, and completed file removal
 - test-only direct peer injection through the goaria extension option `goaria-peer-addrs`

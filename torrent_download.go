@@ -42,6 +42,15 @@ type torrentFileState struct {
 	URIs      []URIInfo
 }
 
+const (
+	torrentPeerProfileQBitTorrent = "qbittorrent"
+	torrentPeerProfileNative      = "native"
+
+	qBittorrentVersion            = "5.2.0"
+	qBittorrentBep20Prefix        = "-qB5200-"
+	qBittorrentPeerVisibleVersion = "qBittorrent/" + qBittorrentVersion
+)
+
 func isMagnetURI(raw string) bool {
 	u, err := url.Parse(raw)
 	return err == nil && strings.EqualFold(u.Scheme, "magnet")
@@ -480,6 +489,38 @@ func parseIndexOut(opts Options) (map[int]string, error) {
 	return out, nil
 }
 
+func applyTorrentClientIdentityOptions(cfg *torrent.ClientConfig, opts Options) error {
+	profile := strings.ToLower(strings.TrimSpace(optionString(opts, "goaria-torrent-peer-profile")))
+	if profile == "" {
+		profile = torrentPeerProfileQBitTorrent
+	}
+	switch profile {
+	case torrentPeerProfileQBitTorrent, "qbt", "qbit":
+		cfg.Bep20 = qBittorrentBep20Prefix
+		cfg.HTTPUserAgent = qBittorrentPeerVisibleVersion
+		cfg.ExtendedHandshakeClientVersion = qBittorrentPeerVisibleVersion
+	case torrentPeerProfileNative, "anacrolix", "goaria":
+		if userAgent := optionString(opts, "user-agent"); userAgent != "" {
+			cfg.HTTPUserAgent = userAgent
+		}
+	default:
+		return fmt.Errorf("invalid goaria-torrent-peer-profile %q", profile)
+	}
+	if prefix := optionString(opts, "goaria-torrent-bep20-prefix"); prefix != "" {
+		if len(prefix) > 20 {
+			return fmt.Errorf("goaria-torrent-bep20-prefix too long: %d bytes", len(prefix))
+		}
+		cfg.Bep20 = prefix
+	}
+	if userAgent := optionString(opts, "goaria-torrent-user-agent"); userAgent != "" {
+		cfg.HTTPUserAgent = userAgent
+	}
+	if version := optionString(opts, "goaria-torrent-client-version"); version != "" {
+		cfg.ExtendedHandshakeClientVersion = version
+	}
+	return nil
+}
+
 func (e *Engine) runTorrentDownload(d *Download) error {
 	d.mu.RLock()
 	ctx := d.ctx
@@ -495,7 +536,9 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = dir
 	cfg.NoDefaultPortForwarding = true
-	cfg.HTTPUserAgent = optionString(opts, "user-agent")
+	if err := applyTorrentClientIdentityOptions(cfg, opts); err != nil {
+		return err
+	}
 	cfg.DefaultStorage = storage.NewFileOpts(storage.NewFileClientOpts{
 		ClientBaseDir:      dir,
 		PieceCompletion:    storage.NewMapPieceCompletion(),
@@ -504,7 +547,7 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
 		FilePathMaker:      torrentFilePathMaker(opts),
 	})
-	if e.cfg.TorrentFileHandler != nil {
+	if optionBool(opts, "goaria-torrent-no-upload") {
 		cfg.NoUpload = true
 	}
 	cfg.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))

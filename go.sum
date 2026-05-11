@@ -358,10 +358,8 @@ github.com/tinylib/msgp v1.1.0/go.mod h1:+d+yLhGm8mzTaHzB+wgMYrodPfmZrzkirds8fDW
 github.com/tinylib/msgp v1.1.2/go.mod h1:+d+yLhGm8mzTaHzB+wgMYrodPfmZrzkirds8fDWklFE=
 github.com/wchen99998/dht/v2 v2.24.2 h1:D94uuhyg4tSQlWoBapJlXs4yszucB5J/i5EtKa21lSA=
 github.com/wchen99998/dht/v2 v2.24.2/go.mod h1:pghmI39D0rGDmRdCVhj+4p7K8LFsm8mAP2XvZXPMFUc=
-github.com/wchen99998/torrent v1.54.2 h1:7021Xl5KkAcRzoaQi93QEG3ceoA3i6tIStrb9bdxsIc=
-github.com/wchen99998/torrent v1.54.2/go.mod h1:7DqvTC01CVdK3k4fX+gQ9vGDPJzPJ4D6fdAiQffutpQ=
-github.com/wchen99998/torrent v1.54.3 h1:BdokbS19rWYz/Ttfb8x0nO6dnfBTM5XkaWgLN9PuW8g=
-github.com/wchen99998/torrent v1.54.3/go.mod h1:7DqvTC01CVdK3k4fX+gQ9vGDPJzPJ4D6fdAiQffutpQ=
+github.com/wchen99998/torrent v1.54.4 h1:5ocYQuApEDOgvFPSVrF6SS5nf1vHoMNoMFAdcmRbUBY=
+github.com/wchen99998/torrent v1.54.4/go.mod h1:7DqvTC01CVdK3k4fX+gQ9vGDPJzPJ4D6fdAiQffutpQ=
 github.com/willf/bitset v1.1.9/go.mod h1:RjeCKbqT1RxIR/KWY6phxZiaY1IyutSBfGjNPySAYV4=
 github.com/willf/bitset v1.1.10/go.mod h1:RjeCKbqT1RxIR/KWY6phxZiaY1IyutSBfGjNPySAYV4=
 github.com/wlynxg/anet v0.0.3 h1:PvR53psxFXstc12jelG6f1Lv4MWqE0tI76/hHGjh9rg=

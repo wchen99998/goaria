@@ -24,6 +24,7 @@ import (
 	"github.com/wchen99998/torrent/bencode"
 	"github.com/wchen99998/torrent/metainfo"
 	"github.com/wchen99998/torrent/storage"
+	"github.com/wchen99998/torrent/stream"
 	"golang.org/x/time/rate"
 )
 
@@ -657,7 +658,7 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	files := tor.Files()
 	selected := selectedTorrentFiles(d, files)
 	if e.cfg.TorrentFileHandler != nil {
-		if err := e.processCompletedTorrentFiles(ctx, d, selected); err != nil {
+		if err := e.processCompletedTorrentFiles(ctx, d, tor); err != nil {
 			return err
 		}
 		e.notify("aria2.onBtDownloadComplete", d.gid)
@@ -787,165 +788,84 @@ func selectedTorrentFiles(d *Download, files []*torrent.File) []selectedTorrentF
 	return out
 }
 
-func (e *Engine) processCompletedTorrentFiles(ctx context.Context, d *Download, files []selectedTorrentFile) error {
-	if len(files) == 0 {
-		return nil
-	}
-	maxActive := optionInt(d.options, "goaria-torrent-max-active-files", len(files))
-	if maxActive <= 0 || maxActive > len(files) {
-		maxActive = len(files)
-	}
-	slots := make(chan struct{}, maxActive)
-	results := make(chan error, len(files))
-	var resultErr error
-	var wg sync.WaitGroup
-queue:
-	for _, item := range files {
-		select {
-		case slots <- struct{}{}:
-		case <-ctx.Done():
-			resultErr = errors.Join(resultErr, ctx.Err())
-			break queue
+func selectedTorrentFileIndexes(d *Download) ([]int, map[int]torrentFileState) {
+	d.mu.RLock()
+	states := append([]torrentFileState(nil), d.torrentFiles...)
+	d.mu.RUnlock()
+	indexes := make([]int, 0, len(states))
+	byIndex := make(map[int]torrentFileState, len(states))
+	for i, state := range states {
+		if !state.Selected {
+			continue
 		}
-		wg.Add(1)
-		go func(item selectedTorrentFile) {
-			defer wg.Done()
-			defer func() { <-slots }()
-			item.file.Download()
-			if err := waitTorrentFileVerifiedComplete(ctx, item.file); err != nil {
-				item.file.SetPriority(torrent.PiecePriorityNone)
-				results <- err
-				return
-			}
-			e.updateTorrentProgress(d, item.file.Torrent())
-			results <- e.handleCompletedTorrentFile(ctx, d, item)
-		}(item)
+		indexes = append(indexes, i)
+		byIndex[i] = state
 	}
-	wg.Wait()
-	close(results)
-	for err := range results {
-		resultErr = errors.Join(resultErr, err)
-	}
-	return resultErr
+	return indexes, byIndex
 }
 
-func (e *Engine) handleCompletedTorrentFile(ctx context.Context, d *Download, item selectedTorrentFile) error {
+func (e *Engine) processCompletedTorrentFiles(ctx context.Context, d *Download, tor *torrent.Torrent) error {
+	indexes, states := selectedTorrentFileIndexes(d)
+	if len(indexes) == 0 {
+		return nil
+	}
+	return stream.Files(ctx, tor, stream.FilesOptions{
+		FileIndexes:            indexes,
+		MaxActive:              optionInt(d.options, "goaria-torrent-max-active-files", len(indexes)),
+		Readahead:              optionBytes(d.options, "goaria-torrent-readahead", 4<<20),
+		RequireExplicitRelease: true,
+	}, func(ctx context.Context, lease *stream.FileLease) error {
+		e.updateTorrentProgress(d, tor)
+		return e.handleCompletedTorrentFile(ctx, d, states[lease.Index], lease)
+	})
+}
+
+func (e *Engine) handleCompletedTorrentFile(ctx context.Context, d *Download, state torrentFileState, lease *stream.FileLease) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	reader := item.file.NewReader()
-	reader.SetContext(ctx)
-	reader.SetReadahead(optionBytes(d.options, "goaria-torrent-readahead", 4<<20))
-	fileReader := newLimitedReadCloser(reader, item.file.Length())
-	done := make(chan error, 1)
 	var once sync.Once
 	var finalizeErr error
-	finalize := func(discard bool) error {
+	finalize := func(ctx context.Context, discard bool) error {
 		once.Do(func() {
-			finalizeErr = fileReader.Close()
 			if discard {
-				finalizeErr = errors.Join(finalizeErr, item.file.DiscardStorage())
+				finalizeErr = lease.Discard(ctx)
 			} else {
-				finalizeErr = errors.Join(finalizeErr, item.file.ReleaseStorage())
+				finalizeErr = lease.Release(ctx)
 			}
 			d.mu.Lock()
-			if item.index >= 0 && item.index < len(d.torrentFiles) {
+			index := state.Index - 1
+			if index >= 0 && index < len(d.torrentFiles) {
 				if discard {
-					d.torrentFiles[item.index].Released = false
+					d.torrentFiles[index].Released = false
 				} else if finalizeErr == nil {
-					d.torrentFiles[item.index].Released = true
-					d.torrentFiles[item.index].Completed = d.torrentFiles[item.index].Length
+					d.torrentFiles[index].Released = true
+					d.torrentFiles[index].Completed = d.torrentFiles[index].Length
 				}
 			}
 			d.mu.Unlock()
-			if removeErr := os.Remove(item.state.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			if removeErr := os.Remove(state.Path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 				finalizeErr = errors.Join(finalizeErr, removeErr)
 			}
-			item.file.SetPriority(torrent.PiecePriorityNone)
-			e.updateTorrentProgress(d, item.file.Torrent())
-			done <- finalizeErr
-			close(done)
+			e.updateTorrentProgress(d, lease.File.Torrent())
 		})
 		return finalizeErr
 	}
 	tf := TorrentFileLease{
 		GID:     d.gid,
-		Index:   item.state.Index,
-		Path:    item.state.Path,
-		Length:  item.state.Length,
-		Reader:  fileReader,
-		Release: func(context.Context) error { return finalize(false) },
-		Discard: func(context.Context) error { return finalize(true) },
+		Index:   state.Index,
+		Path:    state.Path,
+		Length:  state.Length,
+		Reader:  lease.Reader,
+		Release: func(ctx context.Context) error { return finalize(ctx, false) },
+		Discard: func(ctx context.Context) error { return finalize(ctx, true) },
 	}
 	handlerErr := e.cfg.TorrentFileHandler(ctx, tf)
 	if handlerErr != nil {
-		releaseErr := finalize(false)
+		releaseErr := finalize(context.Background(), false)
 		return errors.Join(handlerErr, releaseErr)
 	}
-	select {
-	case releaseErr := <-done:
-		return releaseErr
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-type limitedReadCloser struct {
-	reader io.Reader
-	closer io.Closer
-	once   sync.Once
-	err    error
-}
-
-func newLimitedReadCloser(r io.ReadCloser, n int64) *limitedReadCloser {
-	return &limitedReadCloser{
-		reader: io.LimitReader(r, n),
-		closer: r,
-	}
-}
-
-func waitTorrentFileVerifiedComplete(ctx context.Context, file *torrent.File) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if torrentFileVerifiedComplete(file) {
-			return nil
-		}
-		if err := file.WaitComplete(ctx); err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func torrentFileVerifiedComplete(file *torrent.File) bool {
-	if file.Length() == 0 {
-		return true
-	}
-	for _, state := range file.State() {
-		if !state.Ok || !state.Complete {
-			return false
-		}
-	}
-	return true
-}
-
-func (r *limitedReadCloser) Read(p []byte) (int, error) {
-	return r.reader.Read(p)
-}
-
-func (r *limitedReadCloser) Close() error {
-	r.once.Do(func() {
-		r.err = r.closer.Close()
-	})
-	return r.err
+	return nil
 }
 
 func (e *Engine) startTorrentProgress(ctx context.Context, d *Download, tor *torrent.Torrent) func() {

@@ -50,6 +50,30 @@ func applyRequestOptions(req *http.Request, opts Options) {
 	}
 }
 
+func basicAuthCredentials(req *http.Request, opts Options) (string, string, bool) {
+	if user := optionString(opts, "http-user"); user != "" {
+		return user, optionString(opts, "http-passwd"), true
+	}
+	if req.URL.User != nil {
+		user := req.URL.User.Username()
+		pass, _ := req.URL.User.Password()
+		return user, pass, true
+	}
+	return "", "", false
+}
+
+func hasBasicAuthChallenge(resp *http.Response) bool {
+	for _, value := range resp.Header.Values("WWW-Authenticate") {
+		for _, challenge := range strings.Split(value, ",") {
+			fields := strings.Fields(strings.TrimSpace(challenge))
+			if len(fields) > 0 && strings.EqualFold(fields[0], "Basic") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func applyConditionalHeaders(req *http.Request, opts Options, path string) {
 	if !optionBool(opts, "conditional-get") {
 		return

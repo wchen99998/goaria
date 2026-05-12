@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -32,6 +33,9 @@ func TestRPCMethodSurfaceAndToken(t *testing.T) {
 			t.Fatalf("method %s missing from listMethods", method)
 		}
 	}
+	if methods["aria2.addMetalink"] {
+		t.Fatal("listMethods advertised unsupported aria2.addMetalink")
+	}
 
 	resp = invokeRPC(t, rpc, `{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion"}`)
 	if resp.Error == nil || !strings.Contains(resp.Error.Message, "Unauthorized") {
@@ -41,6 +45,43 @@ func TestRPCMethodSurfaceAndToken(t *testing.T) {
 	resp = invokeRPC(t, rpc, `{"jsonrpc":"2.0","id":"v","method":"aria2.getVersion","params":["token:secret"]}`)
 	if resp.Error != nil {
 		t.Fatalf("getVersion with token failed: %#v", resp.Error)
+	}
+
+	resp = invokeRPC(t, rpc, `{"jsonrpc":"2.0","id":"m","method":"aria2.addMetalink","params":["token:secret",""]}`)
+	if resp.Error == nil || !strings.Contains(resp.Error.Message, "unsupported") {
+		t.Fatalf("expected unsupported addMetalink error, got %#v", resp)
+	}
+}
+
+func TestRPCMalformedSinglePayloadReturnsParseError(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	rpc := NewHandler(engine, "")
+
+	for _, payload := range []string{
+		`not-json`,
+		`{"jsonrpc":"2.0","id":"bad","method":"system.listMethods"} trailing`,
+		`{"jsonrpc":"2.0","id":"bad","method":`,
+	} {
+		data, ok := rpc.HandlePayload([]byte(payload))
+		if !ok {
+			t.Fatalf("no response for %q", payload)
+		}
+		var resp rpcResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp.Error == nil || resp.Error.Code != rpcParseError {
+			t.Fatalf("payload %q returned %#v, want parse error", payload, resp)
+		}
+	}
+
+	resp := invokeRPC(t, rpc, `{}`)
+	if resp.Error == nil || resp.Error.Code != rpcInvalidRequest {
+		t.Fatalf("empty object returned %#v, want invalid request", resp)
 	}
 }
 
@@ -97,6 +138,20 @@ func TestRPCPostGetBatchAndMulticall(t *testing.T) {
 	}
 	if status.Error != nil {
 		t.Fatalf("tellStatus over GET failed: %#v", status.Error)
+	}
+
+	rawParams := url.QueryEscape(`["` + gid + `",["gid","status"]]`)
+	httpResp, err = http.Get(server.URL + "/jsonrpc?method=aria2.tellStatus&id=get-raw&params=" + rawParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer httpResp.Body.Close()
+	status = rpcResponse{}
+	if err := json.NewDecoder(httpResp.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Error != nil {
+		t.Fatalf("tellStatus over raw GET params failed: %#v", status.Error)
 	}
 
 	multi := map[string]any{
@@ -381,6 +436,69 @@ func TestServerCustomPathAndMountableHandler(t *testing.T) {
 	}
 }
 
+func TestJSONPCallbackValidation(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	server := httptest.NewServer(NewServer(engine, Config{}).Handler())
+	defer server.Close()
+
+	resp, err := http.Get(server.URL + "/jsonrpc?method=system.listMethods&id=cb&jsoncallback=goaria.cb_$1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("valid JSONP callback got %s", resp.Status)
+	}
+
+	resp, err = http.Get(server.URL + "/jsonrpc?method=system.listMethods&id=cb&jsoncallback=alert%281%29")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid JSONP callback got %s", resp.Status)
+	}
+}
+
+func TestInvalidJSONPCallbackRejectedBeforeRPCDispatch(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	if _, err := engine.ChangeGlobalOption(goaria.Options{"max-concurrent-downloads": "0"}); err != nil {
+		t.Fatal(err)
+	}
+	gid, err := engine.AddURI([]string{"http://example.invalid/remove-me"}, goaria.Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(NewServer(engine, Config{}).Handler())
+	defer server.Close()
+
+	params := url.QueryEscape(`["` + gid + `"]`)
+	resp, err := http.Get(server.URL + "/jsonrpc?method=aria2.remove&id=remove&params=" + params + "&jsoncallback=alert%281%29")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid JSONP callback got %s", resp.Status)
+	}
+
+	status, err := engine.TellStatus(gid, []string{"status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != string(goaria.StatusPaused) {
+		t.Fatalf("invalid JSONP request mutated status to %v", status["status"])
+	}
+}
+
 func TestWebSocketJSONRPCAndNotification(t *testing.T) {
 	data := []byte("hello websocket")
 	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -426,6 +544,33 @@ func TestWebSocketJSONRPCAndNotification(t *testing.T) {
 		}
 		if notification["method"] == "aria2.onDownloadStart" || notification["method"] == "aria2.onDownloadComplete" {
 			return
+		}
+	}
+}
+
+func TestWebSocketRejectsCrossOriginWithoutSecret(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	server := httptest.NewServer(NewServer(engine, Config{}).Handler())
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/jsonrpc"
+
+	headers := http.Header{}
+	headers.Set("Origin", "https://example.invalid")
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
+	if conn != nil {
+		conn.Close()
+	}
+	if err == nil {
+		t.Fatal("cross-origin websocket dial unexpectedly succeeded")
+	}
+	if resp != nil {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("cross-origin websocket status = %s, want 403", resp.Status)
 		}
 	}
 }

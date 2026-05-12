@@ -308,16 +308,26 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 		d.setMetadata(meta, outPath)
 		return nil
 	}
+	selectedPath := d.outputPath()
+	segmentedMin := minSplit * 2
+	if !optionExplicit(opts, "min-split-size") && segmentedMin < 8<<20 {
+		segmentedMin = 8 << 20
+	}
+	segmented := meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= segmentedMin
+	if selectedPath != "" {
+		outPath = selectedPath
+	} else {
+		outPath, err = resolveExistingOutputPath(outPath, opts, canResumeExistingOutput(outPath, opts, meta, segmented))
+		if err != nil {
+			return err
+		}
+	}
 	if err := e.ensureDownloadDir(filepath.Dir(outPath)); err != nil {
 		return err
 	}
 
 	d.setMetadata(meta, outPath)
-	segmentedMin := minSplit * 2
-	if !optionExplicit(opts, "min-split-size") && segmentedMin < 8<<20 {
-		segmentedMin = 8 << 20
-	}
-	if meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= segmentedMin {
+	if segmented {
 		opts = transportOptionsForSegmented(opts)
 		chunks := makeChunks(meta.Length, concurrency, minSplit)
 		err = e.downloadSegmented(ctx, d, meta, outPath, opts, chunks, limiter)
@@ -583,6 +593,10 @@ func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMet
 func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, rawURI string, opts Options, dirOpt, outOpt string, limiter *rateLimiter) (remoteMeta, string, error) {
 	provisionalName := filenameFromURI(rawURI)
 	provisionalPath := resolveOutputPath(dirOpt, outOpt, provisionalName, rawURI)
+	selectedPath := d.outputPath()
+	if selectedPath != "" {
+		provisionalPath = selectedPath
+	}
 	start := int64(0)
 	var file *os.File
 	createdNew := false
@@ -650,10 +664,19 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 		}
 	}
 	outPath := provisionalPath
-	if outOpt == "" && meta.Filename != "" && meta.Filename != provisionalName {
+	if selectedPath == "" && outOpt == "" && meta.Filename != "" && meta.Filename != provisionalName {
 		outPath = resolveOutputPath(dirOpt, "", meta.Filename, rawURI)
 	}
 	if file == nil {
+		if outPath != provisionalPath || resp.StatusCode != http.StatusPartialContent {
+			start = 0
+		}
+		if selectedPath == "" && start == 0 {
+			outPath, err = resolveExistingOutputPath(outPath, opts, false)
+			if err != nil {
+				return remoteMeta{}, "", err
+			}
+		}
 		if err := e.ensureDownloadDir(filepath.Dir(outPath)); err != nil {
 			return remoteMeta{}, "", err
 		}
@@ -661,7 +684,7 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 
 	if file == nil {
 		flag := os.O_CREATE | os.O_WRONLY
-		if start > 0 && resp.StatusCode == http.StatusPartialContent {
+		if start > 0 {
 			flag |= os.O_APPEND
 		} else {
 			start = 0

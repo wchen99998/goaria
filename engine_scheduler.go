@@ -113,6 +113,11 @@ func (e *Engine) remove(gid string, force bool) (string, error) {
 	e.waiting = removeString(e.waiting, d.gid)
 	delete(e.active, d.gid)
 	d.mu.Lock()
+	if isTerminal(d.status) {
+		d.mu.Unlock()
+		e.mu.Unlock()
+		return "", fmt.Errorf("cannot remove stopped download")
+	}
 	cancel := d.cancel
 	d.cancel = nil
 	d.status = StatusRemoved
@@ -128,7 +133,7 @@ func (e *Engine) remove(gid string, force bool) (string, error) {
 	e.notify("aria2.onDownloadStop", d.gid)
 	e.signal()
 	e.saveSessionBestEffort()
-	return "OK", nil
+	return d.gid, nil
 }
 
 func (e *Engine) pause(gid string, force bool) (string, error) {
@@ -159,7 +164,7 @@ func (e *Engine) pause(gid string, force bool) (string, error) {
 	e.notify("aria2.onDownloadPause", d.gid)
 	e.signal()
 	e.saveSessionBestEffort()
-	return "OK", nil
+	return d.gid, nil
 }
 
 func (e *Engine) insertWaitingLocked(gid string, position *int) {

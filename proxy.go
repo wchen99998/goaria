@@ -36,7 +36,47 @@ func (e *Engine) do(req *http.Request, opts Options) (*http.Response, error) {
 		return nil, err
 	}
 	client = clientWithLoadedCookies(client, optionString(opts, "load-cookies"))
-	return client.Do(req)
+	user, pass, hasAuth := basicAuthCredentials(req, opts)
+	if optionBool(opts, "http-auth-challenge") && req.URL.User != nil && req.Header.Get("Authorization") == "" {
+		retrySafe := req.Clone(req.Context())
+		retrySafe.Header = req.Header.Clone()
+		u := *req.URL
+		u.User = nil
+		retrySafe.URL = &u
+		req = retrySafe
+	}
+	resp, err := client.Do(req)
+	if err != nil || !shouldRetryBasicAuthChallenge(req, opts, resp, hasAuth) {
+		return resp, err
+	}
+	retry := req.Clone(req.Context())
+	retry.Header = req.Header.Clone()
+	if req.Body != nil {
+		if req.GetBody == nil {
+			return resp, nil
+		}
+		body, err := req.GetBody()
+		if err != nil {
+			return resp, nil
+		}
+		retry.Body = body
+	}
+	retry.SetBasicAuth(user, pass)
+	_ = resp.Body.Close()
+	return client.Do(retry)
+}
+
+func shouldRetryBasicAuthChallenge(req *http.Request, opts Options, resp *http.Response, hasAuth bool) bool {
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized || !optionBool(opts, "http-auth-challenge") {
+		return false
+	}
+	if req.Header.Get("Authorization") != "" {
+		return false
+	}
+	if !hasAuth {
+		return false
+	}
+	return hasBasicAuthChallenge(resp)
 }
 
 func (e *Engine) clientFor(scheme string, opts Options) (*http.Client, error) {

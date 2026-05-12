@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -74,6 +75,104 @@ func TestHTTPRequestOptionsAndRemoteTime(t *testing.T) {
 	}
 	if !st.ModTime().Equal(modTime) {
 		t.Fatalf("modtime = %s, want %s", st.ModTime(), modTime)
+	}
+}
+
+func TestHTTPAuthChallengeRetriesWithBasicAuth(t *testing.T) {
+	data := []byte("challenge auth")
+	var unauthenticated atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			unauthenticated.Add(1)
+			w.Header().Set("WWW-Authenticate", `Basic realm="goaria"`)
+			http.Error(w, "auth required", http.StatusUnauthorized)
+			return
+		}
+		if user != "user" || pass != "pass" {
+			t.Errorf("BasicAuth = %q/%q", user, pass)
+			http.Error(w, "bad auth", http.StatusForbidden)
+			return
+		}
+		setDownloadHeaders(w, data)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(data)
+		}
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/auth.txt"}, Options{
+		"out":                 "auth.txt",
+		"split":               "1",
+		"http-user":           "user",
+		"http-passwd":         "pass",
+		"http-auth-challenge": "true",
+		"use-head":            "false",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "auth.txt"), data)
+	if unauthenticated.Load() == 0 {
+		t.Fatal("expected an initial unauthenticated challenge request")
+	}
+}
+
+func TestHTTPAuthChallengeDoesNotPreemptivelySendURLCredentials(t *testing.T) {
+	data := []byte("url challenge auth")
+	var unauthenticated atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			unauthenticated.Add(1)
+			w.Header().Set("WWW-Authenticate", `Basic realm="goaria"`)
+			http.Error(w, "auth required", http.StatusUnauthorized)
+			return
+		}
+		if user != "user" || pass != "pass" {
+			t.Errorf("BasicAuth = %q/%q", user, pass)
+			http.Error(w, "bad auth", http.StatusForbidden)
+			return
+		}
+		setDownloadHeaders(w, data)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(data)
+		}
+	}))
+	defer src.Close()
+
+	u, err := url.Parse(src.URL + "/auth-url.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.User = url.UserPassword("user", "pass")
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{u.String()}, Options{
+		"out":                 "auth-url.txt",
+		"split":               "1",
+		"http-auth-challenge": "true",
+		"use-head":            "false",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "auth-url.txt"), data)
+	if unauthenticated.Load() == 0 {
+		t.Fatal("expected URL credentials to wait for an initial challenge")
 	}
 }
 

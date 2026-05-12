@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +21,7 @@ import (
 )
 
 const (
-	DefaultAddr           = ":6800"
+	DefaultAddr           = "127.0.0.1:6800"
 	DefaultPath           = "/jsonrpc"
 	DefaultMaxRequestSize = 2 << 20
 )
@@ -66,7 +67,9 @@ func NewServer(engine *goaria.Engine, cfg Config) *Server {
 		maxBody: cfg.MaxRequestSize,
 		log:     log,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(*http.Request) bool { return true },
+			CheckOrigin: func(r *http.Request) bool {
+				return cfg.Secret != "" || sameWebSocketOrigin(r)
+			},
 		},
 	}
 }
@@ -136,6 +139,11 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		s.handleWebSocket(w, r)
 		return
 	}
+	callback := r.URL.Query().Get("jsoncallback")
+	if callback != "" && !validJSONPCallback(callback) {
+		http.Error(w, "invalid jsoncallback", http.StatusBadRequest)
+		return
+	}
 	var payload []byte
 	var err error
 	switch r.Method {
@@ -158,7 +166,6 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	callback := r.URL.Query().Get("jsoncallback")
 	if callback != "" {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		_, _ = fmt.Fprintf(w, "%s(%s);", callback, response)
@@ -233,7 +240,7 @@ func buildGETPayload(r *http.Request) ([]byte, error) {
 	var decoded []byte
 	var err error
 	if encoded != "" {
-		decoded, err = base64.StdEncoding.DecodeString(encoded)
+		decoded, err = decodeGETParams(encoded)
 		if err != nil {
 			return nil, err
 		}
@@ -266,4 +273,52 @@ func buildGETPayload(r *http.Request) ([]byte, error) {
 		return nil, fmt.Errorf("params must be a JSON array")
 	}
 	return payload, nil
+}
+
+func decodeGETParams(params string) ([]byte, error) {
+	trimmed := bytes.TrimSpace([]byte(params))
+	if json.Valid(trimmed) {
+		return trimmed, nil
+	}
+	return base64.StdEncoding.DecodeString(params)
+}
+
+func sameWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+func validJSONPCallback(callback string) bool {
+	for _, part := range strings.Split(callback, ".") {
+		if !validJSIdentifier(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func validJSIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_' || r == '$' {
+				continue
+			}
+			return false
+		}
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '$' {
+			continue
+		}
+		return false
+	}
+	return true
 }

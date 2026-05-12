@@ -300,7 +300,7 @@ func (e *Engine) Unpause(gid string) (string, error) {
 	if d.status != StatusPaused {
 		d.mu.Unlock()
 		e.mu.Unlock()
-		return "OK", nil
+		return d.gid, nil
 	}
 	d.status = StatusWaiting
 	d.errorCode = ""
@@ -310,7 +310,7 @@ func (e *Engine) Unpause(gid string) (string, error) {
 	e.mu.Unlock()
 	e.signal()
 	e.saveSessionBestEffort()
-	return "OK", nil
+	return d.gid, nil
 }
 
 func (e *Engine) UnpauseAll() (string, error) {

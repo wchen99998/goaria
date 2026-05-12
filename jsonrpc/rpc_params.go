@@ -3,12 +3,14 @@ package jsonrpc
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"strconv"
 
 	"github.com/wchen99998/goaria"
 )
+
+var errTrailingJSONData = errors.New("invalid trailing JSON data")
 
 func stringParam(params []json.RawMessage, i int) (string, error) {
 	if i >= len(params) {
@@ -92,9 +94,16 @@ func decodeUseNumber(data []byte, v any) error {
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return fmt.Errorf("invalid trailing JSON data")
+			return errTrailingJSONData
 		}
 		return err
 	}
 	return nil
+}
+
+func isJSONParseError(err error) bool {
+	var syntaxErr *json.SyntaxError
+	return errors.As(err, &syntaxErr) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, errTrailingJSONData)
 }

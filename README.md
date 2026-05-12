@@ -11,7 +11,7 @@
 Run an aria2-style JSON-RPC daemon:
 
 ```sh
-go run ./cmd/goaria daemon -listen :6800 -dir ./downloads -rpc-secret secret
+go run ./cmd/goaria daemon -dir ./downloads -rpc-secret secret
 ```
 
 Persist and restore the daemon queue with an aria2-style session file:
@@ -28,7 +28,7 @@ go run ./cmd/goaria -dir ./downloads -split 8 -max-connection-per-server 8 https
 
 For CDN compatibility testing, the direct CLI also accepts `-http-version` (`auto`, `1.1`, `2`, or `3`) and `-user-agent`.
 
-The JSON-RPC endpoint is `/jsonrpc`, matching aria2. HTTP POST, HTTP GET with base64 `params`, JSONP, batch requests, `system.multicall`, and JSON-RPC over WebSocket are implemented.
+The JSON-RPC endpoint is `/jsonrpc`, matching aria2. HTTP POST, HTTP GET with base64 `params` plus raw URL-encoded JSON `params`, JSONP, batch requests, `system.multicall`, and JSON-RPC over WebSocket are implemented.
 
 ## Library
 
@@ -56,7 +56,7 @@ To expose JSON-RPC, import the optional adapter package:
 ```go
 import "github.com/wchen99998/goaria/jsonrpc"
 
-srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: ":6800", Secret: "secret"})
+srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: "127.0.0.1:6800", Secret: "secret"})
 err := srv.ListenAndServe(ctx)
 ```
 
@@ -76,16 +76,15 @@ router.Any("/downloads/rpc", gin.WrapH(srv.JSONRPCHandler()))
 For a server owned by `jsonrpc.Server`, use `Config.Path` to change the route:
 
 ```go
-srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: ":6800", Path: "/downloads/rpc", Secret: "secret"})
+srv := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: "127.0.0.1:6800", Path: "/downloads/rpc", Secret: "secret"})
 ```
 
 ## RPC Coverage
 
-The aria2 JSON-RPC method surface is implemented:
+Most of the aria2 JSON-RPC method surface is implemented. Unsupported methods are not advertised through `system.listMethods`:
 
 - `aria2.addUri`
 - `aria2.addTorrent`
-- `aria2.addMetalink`
 - `aria2.remove`
 - `aria2.forceRemove`
 - `aria2.pause`

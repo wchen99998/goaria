@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -58,6 +59,7 @@ func TestFailureRecoveryResumesSequentialPartialDownload(t *testing.T) {
 	defer engine.Close(context.Background())
 	gid, err := engine.AddURI([]string{src.URL + "/resume.bin"}, Options{
 		"out":       "resume.bin",
+		"continue":  "true",
 		"split":     "1",
 		"max-tries": "3",
 	}, nil)
@@ -68,6 +70,48 @@ func TestFailureRecoveryResumesSequentialPartialDownload(t *testing.T) {
 	assertFileEquals(t, filepath.Join(dir, "resume.bin"), data)
 	if !sawResume.Load() {
 		t.Fatal("expected retry to resume with a Range request")
+	}
+}
+
+func TestRetryReusesSelectedOutputPathWhenAutoRenamingEnabled(t *testing.T) {
+	data := bytes.Repeat([]byte("retry-output-"), 64*1024)
+	cut := len(data) / 4
+	var fullGETs atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		if fullGETs.Add(1) == 1 {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data[:cut])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			return
+		}
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/retry.bin"}, Options{
+		"out":       "retry.bin",
+		"split":     "1",
+		"max-tries": "2",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "retry.bin"), data)
+	if _, err := os.Stat(filepath.Join(dir, "retry.bin.1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("retry created alternate output path: %v", err)
 	}
 }
 

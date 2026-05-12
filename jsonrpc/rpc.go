@@ -23,7 +23,6 @@ const (
 var rpcMethods = []string{
 	"aria2.addUri",
 	"aria2.addTorrent",
-	"aria2.addMetalink",
 	"aria2.remove",
 	"aria2.forceRemove",
 	"aria2.pause",
@@ -140,6 +139,9 @@ func (h *RPCHandler) handleOne(raw []byte) (rpcResponse, bool) {
 		var ce callError
 		if errors.As(err, &ce) {
 			return errorResponse(call.ID, ce.code, ce.msg), true
+		}
+		if isJSONParseError(err) {
+			return errorResponse(nil, rpcParseError, "Parse error"), true
 		}
 		return errorResponse(nil, rpcInvalidRequest, "Invalid Request"), true
 	}

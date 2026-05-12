@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://goaria.local/schemas/aria2-jsonrpc.schema.json",
   "title": "goaria aria2-compatible JSON-RPC request",
-  "description": "JSON-RPC 2.0 request and batch request schema for the aria2 JSON-RPC method surface implemented by goaria. Method signatures are based on the aria2 JSON-RPC manual and include goaria's HTTP/S-focused superset options.",
+  "description": "JSON-RPC 2.0 request and batch request schema for the aria2 JSON-RPC methods currently supported by goaria. Method signatures are based on the aria2 JSON-RPC manual and include goaria's HTTP/S-focused superset options.",
   "oneOf": [
     { "$ref": "#/$defs/request" },
     { "$ref": "#/$defs/batchRequest" }
@@ -17,7 +17,6 @@
       "oneOf": [
         { "$ref": "#/$defs/addUri" },
         { "$ref": "#/$defs/addTorrent" },
-        { "$ref": "#/$defs/addMetalink" },
         { "$ref": "#/$defs/gidOnly" },
         { "$ref": "#/$defs/noArgAria" },
         { "$ref": "#/$defs/tellStatus" },
@@ -268,41 +267,6 @@
                   "prefixItems": [
                     { "$ref": "#/$defs/token" },
                     { "$ref": "#/$defs/torrentSource" },
-                    { "$ref": "#/$defs/options" },
-                    { "$ref": "#/$defs/position" }
-                  ]
-                }
-              ]
-            }
-          }
-        }
-      ]
-    },
-    "addMetalink": {
-      "allOf": [
-        { "$ref": "#/$defs/base" },
-        {
-          "properties": {
-            "method": { "const": "aria2.addMetalink" },
-            "params": {
-              "oneOf": [
-                {
-                  "type": "array",
-                  "minItems": 1,
-                  "maxItems": 3,
-                  "prefixItems": [
-                    { "type": "string", "maxLength": 1048576 },
-                    { "$ref": "#/$defs/options" },
-                    { "$ref": "#/$defs/position" }
-                  ]
-                },
-                {
-                  "type": "array",
-                  "minItems": 2,
-                  "maxItems": 4,
-                  "prefixItems": [
-                    { "$ref": "#/$defs/token" },
-                    { "type": "string", "maxLength": 1048576 },
                     { "$ref": "#/$defs/options" },
                     { "$ref": "#/$defs/position" }
                   ]
@@ -613,7 +577,6 @@
       "enum": [
         "aria2.addUri",
         "aria2.addTorrent",
-        "aria2.addMetalink",
         "aria2.remove",
         "aria2.forceRemove",
         "aria2.pause",

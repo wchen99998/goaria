@@ -60,6 +60,46 @@ func resolveOutputPath(dir, out, filename, rawURI string) string {
 	return filepath.Join(dir, filepath.Clean(out))
 }
 
+func resolveExistingOutputPath(path string, opts Options, allowResume bool) (string, error) {
+	st, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("output path is a directory: %s", path)
+	}
+	if allowResume || optionBool(opts, "allow-overwrite") {
+		return path, nil
+	}
+	if optionBoolDefault(opts, "auto-file-renaming", true) {
+		return nextAvailableOutputPath(path)
+	}
+	return "", fmt.Errorf("file already exists: %s", path)
+}
+
+func canResumeExistingOutput(path string, opts Options, meta remoteMeta, segmented bool) bool {
+	if segmented || !optionBool(opts, "continue") || !meta.AcceptRange || meta.Length <= 0 {
+		return false
+	}
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir() && st.Size() > 0 && st.Size() < meta.Length
+}
+
+func nextAvailableOutputPath(path string) (string, error) {
+	for i := 1; i < 10000; i++ {
+		candidate := fmt.Sprintf("%s.%d", path, i)
+		if _, err := os.Stat(candidate); errors.Is(err, os.ErrNotExist) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not find available auto-renamed path for %s", path)
+}
+
 func isSimpleRelativeName(name string) bool {
 	return name != "" &&
 		name != "." &&

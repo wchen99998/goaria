@@ -32,6 +32,12 @@ func (d *Download) setMetadata(meta remoteMeta, path string) {
 	d.bitfield = ""
 }
 
+func (d *Download) outputPath() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.path
+}
+
 func (d *Download) resetProgress(total int64, chunks []chunkRange) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

@@ -34,7 +34,7 @@ func run() error {
 
 func runDaemon(args []string) error {
 	fs := flag.NewFlagSet("goaria daemon", flag.ExitOnError)
-	addr := fs.String("listen", ":6800", "RPC listen address")
+	addr := fs.String("listen", jsonrpc.DefaultAddr, "RPC listen address")
 	dir := fs.String("dir", ".", "download directory")
 	inputFile := fs.String("input-file", "", "aria2-style session/input file to load at startup")
 	saveSession := fs.String("save-session", "", "aria2-style session file to save automatically")

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -289,6 +290,89 @@ func TestRPCAddTorrentAcceptsTorrentURLSource(t *testing.T) {
 	}
 	if len(uris) != 1 || uris[0].URI != webseed {
 		t.Fatalf("torrent webseeds = %#v, want only %q", uris, webseed)
+	}
+}
+
+func TestRPCAddTorrentURLAutoSavedSessionRestoresWithoutGracefulClose(t *testing.T) {
+	data, err := os.ReadFile("../test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-bittorrent")
+		_, _ = w.Write(data)
+	}))
+	defer source.Close()
+
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "goaria.session")
+	engine, err := goaria.NewEngine(goaria.Config{Dir: dir, SaveSession: sessionPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	if _, err := engine.ChangeGlobalOption(goaria.Options{"max-concurrent-downloads": "0"}); err != nil {
+		t.Fatal(err)
+	}
+	rpc := NewHandler(engine, "")
+
+	const gid = "5555555555555555"
+	webseed := "https://cdn.example.com/payload-file"
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "torrent-url-session",
+		"method":  "aria2.addTorrent",
+		"params": []any{
+			source.URL + "/file.torrent",
+			[]string{webseed},
+			map[string]any{"gid": gid},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := invokeRPC(t, rpc, string(payload))
+	if resp.Error != nil {
+		t.Fatalf("addTorrent URL failed: %#v", resp.Error)
+	}
+	if resp.Result != gid {
+		t.Fatalf("gid = %#v, want %s", resp.Result, gid)
+	}
+
+	sessionData, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := string(sessionData)
+	firstLine, _, _ := strings.Cut(session, "\n")
+	if !strings.Contains(session, "gid="+gid) || !strings.Contains(session, "pause=false") {
+		t.Fatalf("auto-saved session did not keep queued torrent state:\n%s", session)
+	}
+	if strings.Contains(firstLine, source.URL) {
+		t.Fatalf("session URI line still depends on source torrent URL:\n%s", session)
+	}
+	if !strings.Contains(firstLine, webseed) {
+		t.Fatalf("session URI line did not preserve webseed:\n%s", session)
+	}
+
+	source.Close()
+	restored, err := goaria.NewEngine(goaria.Config{Dir: dir, InputFile: sessionPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close(context.Background())
+	status, err := restored.TellStatus(gid, []string{"status", "infoHash", "bittorrent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != string(goaria.StatusWaiting) && status["status"] != string(goaria.StatusActive) {
+		t.Fatalf("restored status = %v, want waiting or active", status["status"])
+	}
+	if len(status["infoHash"].(string)) != 40 {
+		t.Fatalf("bad restored infoHash: %#v", status["infoHash"])
+	}
+	if _, ok := status["bittorrent"].(*goaria.BittorrentInfo); !ok {
+		t.Fatalf("restored torrent lost bittorrent metadata: %#v", status)
 	}
 }
 

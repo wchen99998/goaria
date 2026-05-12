@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
+	"github.com/wchen99998/torrent/metainfo"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2"
 )
@@ -428,12 +429,83 @@ func (e *Engine) ChangeOption(gid string, opts Options) (string, error) {
 		return "", err
 	}
 	d.mu.Lock()
-	d.options = mergeOptions(d.options, opts)
+	merged := mergeOptions(d.options, opts)
+	var torrentInfo *torrentMetadataInfo
+	if d.kind == downloadKindTorrent {
+		if err := validateTorrentExtensionOptions(merged); err != nil {
+			d.mu.Unlock()
+			return "", err
+		}
+		torrentInfo, err = d.metadataInfoLocked()
+		if err != nil {
+			d.mu.Unlock()
+			return "", err
+		}
+	}
+	d.options = merged
 	d.dir = optionString(d.options, "dir")
 	d.out = optionString(d.options, "out")
+	if torrentInfo != nil {
+		d.torrentFiles, d.totalLength, d.completedLen = rebuildTorrentFileStatesPreservingProgress(torrentInfo.info, d.options, d.dir, d.uris, d.torrentFiles)
+		d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
+	}
 	d.mu.Unlock()
 	e.saveSessionBestEffort()
 	return "OK", nil
+}
+
+type torrentMetadataInfo struct {
+	info metainfo.Info
+}
+
+func (d *Download) metadataInfoLocked() (*torrentMetadataInfo, error) {
+	if len(d.torrentData) > 0 {
+		_, info, err := torrentMetaInfo(d.torrentData)
+		if err != nil {
+			return nil, err
+		}
+		return &torrentMetadataInfo{info: info}, nil
+	}
+	if d.torrent != nil && d.torrent.torrent != nil {
+		mi := d.torrent.torrent.Metainfo()
+		if len(mi.InfoBytes) == 0 {
+			return nil, nil
+		}
+		info, err := mi.UnmarshalInfo()
+		if err != nil {
+			return nil, err
+		}
+		return &torrentMetadataInfo{info: info}, nil
+	}
+	return nil, nil
+}
+
+func rebuildTorrentFileStatesPreservingProgress(info metainfo.Info, opts Options, dir string, uris []URIInfo, previous []torrentFileState) ([]torrentFileState, int64, int64) {
+	next := torrentFileStates(info, opts, dir, uris)
+	byIndex := make(map[int]torrentFileState, len(previous))
+	for _, state := range previous {
+		byIndex[state.Index] = state
+	}
+	var total int64
+	var completed int64
+	for i := range next {
+		if old, ok := byIndex[next[i].Index]; ok {
+			next[i].Released = old.Released
+			if old.Released {
+				next[i].Completed = next[i].Length
+			} else {
+				next[i].Completed = old.Completed
+				if next[i].Completed > next[i].Length {
+					next[i].Completed = next[i].Length
+				}
+			}
+		}
+		if next[i].Selected {
+			total += next[i].Length
+			completed += next[i].Completed
+		}
+	}
+	return next, total, completed
 }
 
 func (e *Engine) GetGlobalOption() map[string]any {
@@ -444,7 +516,12 @@ func (e *Engine) GetGlobalOption() map[string]any {
 
 func (e *Engine) ChangeGlobalOption(opts Options) (string, error) {
 	e.mu.Lock()
-	e.global = mergeOptions(e.global, opts)
+	merged := mergeOptions(e.global, opts)
+	if err := validateTorrentExtensionOptions(merged); err != nil {
+		e.mu.Unlock()
+		return "", err
+	}
+	e.global = merged
 	e.cfg.MaxConcurrentDownloads = optionInt(e.global, "max-concurrent-downloads", e.cfg.MaxConcurrentDownloads)
 	e.cfg.MaxDownloadResult = optionInt(e.global, "max-download-result", e.cfg.MaxDownloadResult)
 	e.mu.Unlock()

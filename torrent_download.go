@@ -47,6 +47,9 @@ const (
 	torrentPeerProfileQBitTorrent = "qbittorrent"
 	torrentPeerProfileNative      = "native"
 
+	torrentSelectFileExtOption  = "goaria-select-file-ext"
+	torrentExcludeFileExtOption = "goaria-exclude-file-ext"
+
 	qBittorrentVersion            = "5.2.0"
 	qBittorrentBep20Prefix        = "-qB5200-"
 	qBittorrentPeerVisibleVersion = "qBittorrent/" + qBittorrentVersion
@@ -239,6 +242,10 @@ func (e *Engine) addMagnet(raw string, opts Options, position *int) (string, err
 		return "", ErrShutdown
 	}
 	merged := layerOptions(e.global, opts)
+	if err := validateTorrentExtensionOptions(merged); err != nil {
+		e.mu.Unlock()
+		return "", err
+	}
 	gid := optionString(merged, "gid")
 	if gid == "" {
 		gid = randomHex(8)
@@ -362,8 +369,11 @@ func bittorrentInfo(mi *metainfo.MetaInfo, info metainfo.Info) *BittorrentInfo {
 
 func torrentFileStates(info metainfo.Info, opts Options, dir string, uris []URIInfo) []torrentFileState {
 	files := info.UpvertedFiles()
-	selected := selectedFileSet(len(files), optionString(opts, "select-file"))
 	indexOut, _ := parseIndexOut(opts)
+	selected, _, err := torrentSelectionAndIndexOut(info, opts)
+	if err != nil {
+		selected = selectedFileSet(len(files), optionString(opts, "select-file"))
+	}
 	out := make([]torrentFileState, 0, len(files))
 	for i, fi := range files {
 		index := i + 1
@@ -434,6 +444,10 @@ func torrentSelectionAndIndexOut(info metainfo.Info, opts Options) (map[int]bool
 			return nil, nil, fmt.Errorf("select-file index %d out of range", index)
 		}
 	}
+	selected, err = applyTorrentExtensionSelection(info, selected, indexOut, opts)
+	if err != nil {
+		return nil, nil, err
+	}
 	return selected, indexOut, nil
 }
 
@@ -488,6 +502,92 @@ func parseIndexOut(opts Options) (map[int]string, error) {
 		out[index] = path
 	}
 	return out, nil
+}
+
+type torrentExtensionFilters struct {
+	include map[string]struct{}
+	exclude map[string]struct{}
+}
+
+func validateTorrentExtensionOptions(opts Options) error {
+	_, err := parseTorrentExtensionFilters(opts)
+	return err
+}
+
+func parseTorrentExtensionFilters(opts Options) (torrentExtensionFilters, error) {
+	include, err := parseTorrentExtensionFilter(opts, torrentSelectFileExtOption)
+	if err != nil {
+		return torrentExtensionFilters{}, err
+	}
+	exclude, err := parseTorrentExtensionFilter(opts, torrentExcludeFileExtOption)
+	if err != nil {
+		return torrentExtensionFilters{}, err
+	}
+	return torrentExtensionFilters{include: include, exclude: exclude}, nil
+}
+
+func parseTorrentExtensionFilter(opts Options, key string) (map[string]struct{}, error) {
+	exts := make(map[string]struct{})
+	for _, raw := range splitCSVOptions(opts, key) {
+		ext := strings.ToLower(strings.TrimSpace(raw))
+		if ext == "" {
+			continue
+		}
+		if ext == "." || strings.ContainsAny(ext, `/\`) || strings.ContainsRune(ext, '\x00') {
+			return nil, fmt.Errorf("invalid %s extension %q", key, raw)
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		exts[ext] = struct{}{}
+	}
+	return exts, nil
+}
+
+func applyTorrentExtensionSelection(info metainfo.Info, selected map[int]bool, indexOut map[int]string, opts Options) (map[int]bool, error) {
+	filters, err := parseTorrentExtensionFilters(opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(filters.include) == 0 && len(filters.exclude) == 0 {
+		return selected, nil
+	}
+	files := info.UpvertedFiles()
+	out := make(map[int]bool, len(selected))
+	for i, fi := range files {
+		index := i + 1
+		if !selected[index] {
+			continue
+		}
+		path := torrentDisplayPath(info, fi)
+		if override := indexOut[index]; override != "" {
+			path = override
+		}
+		if filters.matches(path) {
+			out[index] = true
+		}
+	}
+	return out, nil
+}
+
+func (f torrentExtensionFilters) matches(path string) bool {
+	lowerPath := strings.ToLower(filepath.ToSlash(path))
+	if len(f.include) > 0 && !matchesTorrentExtension(lowerPath, f.include) {
+		return false
+	}
+	if len(f.exclude) > 0 && matchesTorrentExtension(lowerPath, f.exclude) {
+		return false
+	}
+	return true
+}
+
+func matchesTorrentExtension(path string, exts map[string]struct{}) bool {
+	for ext := range exts {
+		if strings.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyTorrentClientIdentityOptions(cfg *torrent.ClientConfig, opts Options) error {
@@ -643,6 +743,11 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 		return ctx.Err()
 	case <-tor.GotInfo():
 	}
+	d.mu.RLock()
+	opts = d.options
+	dir = d.dir
+	webseeds = cloneURIs(d.uris)
+	d.mu.RUnlock()
 	if err := e.refreshTorrentMetadata(d, tor, opts, dir, webseeds); err != nil {
 		return err
 	}

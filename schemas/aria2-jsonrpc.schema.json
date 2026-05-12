@@ -84,6 +84,12 @@
       "maxItems": 64,
       "items": { "type": "string", "maxLength": 256 }
     },
+    "extensionList": {
+      "oneOf": [
+        { "type": "string", "maxLength": 2048 },
+        { "$ref": "#/$defs/stringList" }
+      ]
+    },
     "position": {
       "type": "integer",
       "minimum": 0
@@ -120,9 +126,11 @@
         "goaria-disable-dht": { "$ref": "#/$defs/boolString" },
         "goaria-disable-trackers": { "$ref": "#/$defs/boolString" },
         "goaria-disable-utp": { "$ref": "#/$defs/boolString" },
+        "goaria-exclude-file-ext": { "$ref": "#/$defs/extensionList" },
         "goaria-listen-host": { "type": "string", "maxLength": 256 },
         "goaria-peer-addrs": { "$ref": "#/$defs/stringList" },
         "goaria-max-torrent-size": { "$ref": "#/$defs/sizeString" },
+        "goaria-select-file-ext": { "$ref": "#/$defs/extensionList" },
         "goaria-torrent-bep20-prefix": { "type": "string", "maxLength": 20 },
         "goaria-torrent-client-version": { "type": "string", "maxLength": 256 },
         "goaria-torrent-max-active-files": { "$ref": "#/$defs/nonNegativeString" },

@@ -341,28 +341,38 @@ func TestTorrentCompletesWhenNoFilesAreSelected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := NewEngine(Config{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer engine.Close(context.Background())
+	for name, extra := range map[string]Options{
+		"select-file":         {"select-file": "not-a-number"},
+		"extension selection": {"goaria-select-file-ext": ".missing"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			engine, err := NewEngine(Config{Dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close(context.Background())
 
-	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
-		"select-file":             "not-a-number",
-		"goaria-disable-dht":      "true",
-		"goaria-disable-trackers": "true",
-		"goaria-disable-utp":      "true",
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForStatus(t, engine, gid, StatusComplete)
-	status, err := engine.TellStatus(gid, []string{"totalLength", "completedLength"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status["totalLength"] != "0" || status["completedLength"] != "0" {
-		t.Fatalf("empty selection status = %#v", status)
+			opts := Options{
+				"goaria-disable-dht":      "true",
+				"goaria-disable-trackers": "true",
+				"goaria-disable-utp":      "true",
+			}
+			for k, v := range extra {
+				opts[k] = v
+			}
+			gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, opts, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForStatus(t, engine, gid, StatusComplete)
+			status, err := engine.TellStatus(gid, []string{"totalLength", "completedLength"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status["totalLength"] != "0" || status["completedLength"] != "0" {
+				t.Fatalf("empty selection status = %#v", status)
+			}
+		})
 	}
 }
 
@@ -430,6 +440,57 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	}
 	if all := selectedFileSet(1, "999"); !all[1] || len(all) != 1 {
 		t.Fatalf("single-file selection should select the only file: %#v", all)
+	}
+
+	extInfo := metainfo.Info{
+		Name:        "bundle",
+		PieceLength: 16,
+		Files: []metainfo.FileInfo{
+			{Path: []string{"movie.MKV"}, Length: 10},
+			{Path: []string{"clip.mp4"}, Length: 20},
+			{Path: []string{"archive.tar.gz"}, Length: 30},
+			{Path: []string{"poster.JPG"}, Length: 40},
+			{Path: []string{"notes.nfo"}, Length: 50},
+		},
+	}
+	selected, _, err = torrentSelectionAndIndexOut(extInfo, Options{"goaria-select-file-ext": []string{"mkv", ".tar.gz"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []int{1, 3} {
+		if !selected[index] {
+			t.Fatalf("extension selection missing index %d: %#v", index, selected)
+		}
+	}
+	if selected[2] || selected[4] || selected[5] {
+		t.Fatalf("extension selection selected unexpected indexes: %#v", selected)
+	}
+	selected, _, err = torrentSelectionAndIndexOut(extInfo, Options{
+		"select-file":             "1-2,4",
+		"goaria-select-file-ext":  ".mkv,.jpg",
+		"goaria-exclude-file-ext": "jpg",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selected[1] || len(selected) != 1 {
+		t.Fatalf("composed extension selection = %#v, want only index 1", selected)
+	}
+	selected, _, err = torrentSelectionAndIndexOut(extInfo, Options{"goaria-select-file-ext": ".flac"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(selected) != 0 {
+		t.Fatalf("no-match extension selection = %#v, want no files", selected)
+	}
+	for _, opts := range []Options{
+		{"goaria-select-file-ext": "bad/name"},
+		{"goaria-select-file-ext": "."},
+		{"goaria-exclude-file-ext": []string{"ok", `bad\name`}},
+	} {
+		if _, _, err := torrentSelectionAndIndexOut(extInfo, opts); err == nil {
+			t.Fatalf("torrentSelectionAndIndexOut(%#v) succeeded, want error", opts)
+		}
 	}
 
 	indexOut, err := parseIndexOut(Options{"index-out": []string{"2=renamed.txt", "3= nested/ok.txt "}})
@@ -669,8 +730,16 @@ func TestAddTorrentAndMagnetRejectInvalidInputs(t *testing.T) {
 			_, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "index-out": "999=missing.txt"}, nil)
 			return err
 		},
+		"bad torrent extension selection": func() error {
+			_, err := engine.AddTorrent(encoded, nil, Options{"pause": "true", "goaria-select-file-ext": "bad/name"}, nil)
+			return err
+		},
 		"bad magnet": func() error {
 			_, err := engine.AddURI([]string{"magnet:?xt=urn:btih:not-a-hash"}, Options{"pause": "true"}, nil)
+			return err
+		},
+		"bad magnet extension selection": func() error {
+			_, err := engine.AddURI([]string{magnet}, Options{"pause": "true", "goaria-exclude-file-ext": "."}, nil)
 			return err
 		},
 		"mixed magnet": func() error {
@@ -728,6 +797,234 @@ func TestAddTorrentAndMagnetRejectInvalidInputs(t *testing.T) {
 	}
 	if _, err := closed.AddURI([]string{magnet}, Options{"pause": "true"}, nil); !errors.Is(err, ErrShutdown) {
 		t.Fatalf("AddURI magnet after Close error = %v, want ErrShutdown", err)
+	}
+}
+
+func TestTorrentChangeOptionAppliesExtensionSelection(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ChangeOption(gid, Options{"goaria-select-file-ext": ".missing"}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.Selected != "false" {
+			t.Fatalf("file %s selected = %s, want false after no-match extension filter", file.Index, file.Selected)
+		}
+	}
+	status, err := engine.TellStatus(gid, []string{"totalLength"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["totalLength"] != "0" {
+		t.Fatalf("totalLength = %v, want 0", status["totalLength"])
+	}
+	if _, err := engine.ChangeOption(gid, Options{"goaria-select-file-ext": ".txt"}); err != nil {
+		t.Fatal(err)
+	}
+	files, err = engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.Selected != "true" {
+			t.Fatalf("file %s selected = %s, want true after .txt extension filter", file.Index, file.Selected)
+		}
+	}
+	gotOpts, err := engine.GetOption(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotOpts["goaria-select-file-ext"] != ".txt" {
+		t.Fatalf("goaria-select-file-ext option = %v, want .txt", gotOpts["goaria-select-file-ext"])
+	}
+	if _, ok := gotOpts["select-file"]; ok {
+		t.Fatalf("GetOption synthesized select-file: %#v", gotOpts["select-file"])
+	}
+	if _, err := engine.ChangeOption(gid, Options{"goaria-exclude-file-ext": "bad/name"}); err == nil {
+		t.Fatal("ChangeOption accepted invalid extension filter")
+	}
+	if _, err := engine.ChangeGlobalOption(Options{"goaria-select-file-ext": "bad/name"}); err == nil {
+		t.Fatal("ChangeGlobalOption accepted invalid extension filter")
+	}
+}
+
+func TestChangeOptionActiveMagnetBeforeMetadata(t *testing.T) {
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddURI([]string{magnetFixtureURI()}, Options{
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForActiveMagnetWithoutMetadata(t, engine, gid)
+
+	if _, err := engine.ChangeOption(gid, Options{"max-download-limit": "1K"}); err != nil {
+		t.Fatalf("ChangeOption before magnet metadata = %v, want nil", err)
+	}
+}
+
+func TestMagnetChangeOptionBeforeMetadataAffectsLoadedSelection(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, _, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	magnet := fmt.Sprintf("magnet:?xt=urn:btih:%s&dn=fixture", mi.HashInfoBytes().HexString())
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{magnet}, Options{
+		"bt-metadata-only":         "true",
+		"goaria-disable-dht":       "true",
+		"goaria-disable-trackers":  "true",
+		"goaria-disable-utp":       "true",
+		"max-concurrent-downloads": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tor := waitForActiveMagnetWithoutMetadata(t, engine, gid)
+	if _, err := engine.ChangeOption(gid, Options{"goaria-select-file-ext": ".missing"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tor.MergeSpec(&torrent.TorrentSpec{PeerAddrs: peerAddrs}); err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.Selected != "false" {
+			t.Fatalf("file %s selected = %s, want false from pre-metadata ChangeOption", file.Index, file.Selected)
+		}
+	}
+}
+
+func waitForActiveMagnetWithoutMetadata(t *testing.T, engine *Engine, gid string) *torrent.Torrent {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		engine.mu.RLock()
+		d := engine.downloads[gid]
+		engine.mu.RUnlock()
+		if d != nil {
+			d.mu.RLock()
+			tor := d.torrent
+			var activeWithoutMetadata bool
+			if tor != nil && tor.torrent != nil {
+				activeWithoutMetadata = len(tor.torrent.Metainfo().InfoBytes) == 0
+			}
+			d.mu.RUnlock()
+			if activeWithoutMetadata {
+				return tor.torrent
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("magnet did not become active without metadata")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTorrentChangeOptionPreservesProgressWhenRebuildingFiles(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.mu.RLock()
+	d := engine.downloads[gid]
+	engine.mu.RUnlock()
+	d.mu.Lock()
+	firstCompleted := d.torrentFiles[0].Length
+	secondCompleted := int64(7)
+	d.torrentFiles[0].Completed = firstCompleted
+	d.torrentFiles[0].Released = true
+	d.torrentFiles[1].Completed = secondCompleted
+	d.completedLen = firstCompleted + secondCompleted
+	d.mu.Unlock()
+
+	if _, err := engine.ChangeOption(gid, Options{"goaria-select-file-ext": ".missing"}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files[0].CompletedLength != files[0].Length || files[0].Selected != "false" {
+		t.Fatalf("completed unselected file was not preserved: %#v", files[0])
+	}
+	status, err := engine.TellStatus(gid, []string{"totalLength", "completedLength"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["totalLength"] != "0" || status["completedLength"] != "0" {
+		t.Fatalf("unselected progress status = %#v, want zero selected lengths", status)
+	}
+	if _, err := engine.ChangeOption(gid, Options{"goaria-select-file-ext": ".txt"}); err != nil {
+		t.Fatal(err)
+	}
+	files, err = engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files[0].CompletedLength != files[0].Length || files[1].CompletedLength != strconv.FormatInt(secondCompleted, 10) {
+		t.Fatalf("progress after reselection = %#v", files)
+	}
+	status, err = engine.TellStatus(gid, []string{"completedLength"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["completedLength"] != strconv.FormatInt(firstCompleted+secondCompleted, 10) {
+		t.Fatalf("completedLength after reselection = %v, want %d", status["completedLength"], firstCompleted+secondCompleted)
+	}
+	d.mu.RLock()
+	released := d.torrentFiles[0].Released
+	d.mu.RUnlock()
+	if !released {
+		t.Fatal("released state was not preserved")
 	}
 }
 
@@ -855,6 +1152,48 @@ func TestMagnetValidatesFileSelectionAfterMetadataLoads(t *testing.T) {
 			}
 			waitForStatus(t, engine, gid, StatusError)
 		})
+	}
+}
+
+func TestMagnetAppliesExtensionSelectionAfterMetadataLoads(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, _, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	magnet := fmt.Sprintf("magnet:?xt=urn:btih:%s&dn=fixture", mi.HashInfoBytes().HexString())
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{magnet}, Options{
+		"bt-metadata-only":         "true",
+		"goaria-select-file-ext":   ".missing",
+		"goaria-disable-dht":       "true",
+		"goaria-disable-trackers":  "true",
+		"goaria-disable-utp":       "true",
+		"goaria-peer-addrs":        peerAddrs,
+		"max-concurrent-downloads": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.Selected != "false" {
+			t.Fatalf("magnet file %s selected = %s, want false", file.Index, file.Selected)
+		}
 	}
 }
 

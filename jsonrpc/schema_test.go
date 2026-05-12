@@ -62,6 +62,7 @@ func TestJSONRPCSchemaAcceptsKnownRequests(t *testing.T) {
 	for _, example := range []string{
 		`{"jsonrpc":"2.0","id":"1","method":"aria2.addUri","params":[["https://example.com/file"],{"out":"file"}]}`,
 		`{"jsonrpc":"2.0","id":"torrent","method":"aria2.addTorrent","params":["ZHVtbXk",{"pause":"true"},0]}`,
+		`{"jsonrpc":"2.0","id":"torrent-ext-filter","method":"aria2.addTorrent","params":["ZHVtbXk",{"goaria-select-file-ext":".mp4,.mkv","goaria-exclude-file-ext":["nfo","txt"]},0]}`,
 		`{"jsonrpc":"2.0","id":"torrent-url","method":"aria2.addTorrent","params":["https://example.com/file.torrent",{"pause":"true","header":["Authorization: Bearer token"],"goaria-max-torrent-size":"16M"},0]}`,
 		`{"jsonrpc":"2.0","id":"torrent-webseed","method":"aria2.addTorrent","params":["ZHVtbXk",["https://example.com/webseed"],{"pause":"true"},0]}`,
 		`{"jsonrpc":"2.0","id":"torrent-url-webseed","method":"aria2.addTorrent","params":["https://example.com/file.torrent",["https://cdn.example.com/payload-file"],{"pause":"true","user-agent":"goaria-client/1.0","load-cookies":"/tmp/cookies.txt"},0]}`,

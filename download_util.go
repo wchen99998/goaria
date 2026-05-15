@@ -19,19 +19,196 @@ import (
 	"time"
 )
 
+type httpProtocolError struct {
+	message string
+}
+
+func (e *httpProtocolError) Error() string {
+	return e.message
+}
+
+func newHTTPProtocolError(format string, args ...any) error {
+	return &httpProtocolError{message: fmt.Sprintf(format, args...)}
+}
+
+type byteContentRange struct {
+	start       int64
+	end         int64
+	total       int64
+	totalKnown  bool
+	unsatisfied bool
+}
+
 func parseContentRangeTotal(s string) int64 {
+	cr, ok := parseByteContentRange(s)
+	if !ok || !cr.totalKnown {
+		return -1
+	}
+	return cr.total
+}
+
+func parseByteContentRange(s string) (byteContentRange, bool) {
+	fields := strings.Fields(strings.TrimSpace(s))
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "bytes") {
+		return byteContentRange{}, false
+	}
+	rangePart, totalPart, ok := strings.Cut(fields[1], "/")
+	if !ok || totalPart == "" {
+		return byteContentRange{}, false
+	}
+	totalKnown := totalPart != "*"
+	total := int64(-1)
+	if totalKnown {
+		var ok bool
+		total, ok = parseHTTPNonNegativeDecimal(totalPart)
+		if !ok {
+			return byteContentRange{}, false
+		}
+	}
+	if rangePart == "*" {
+		if !totalKnown {
+			return byteContentRange{}, false
+		}
+		return byteContentRange{total: total, totalKnown: true, unsatisfied: true}, true
+	}
+	startPart, endPart, ok := strings.Cut(rangePart, "-")
+	if !ok {
+		return byteContentRange{}, false
+	}
+	start, ok := parseHTTPNonNegativeDecimal(startPart)
+	if !ok {
+		return byteContentRange{}, false
+	}
+	end, ok := parseHTTPNonNegativeDecimal(endPart)
+	if !ok || end < start {
+		return byteContentRange{}, false
+	}
+	if totalKnown && end >= total {
+		return byteContentRange{}, false
+	}
+	return byteContentRange{start: start, end: end, total: total, totalKnown: totalKnown}, true
+}
+
+func parseHTTPNonNegativeDecimal(s string) (int64, bool) {
 	if s == "" {
-		return -1
+		return 0, false
 	}
-	_, after, ok := strings.Cut(s, "/")
-	if !ok || after == "*" {
-		return -1
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
 	}
-	n, err := strconv.ParseInt(after, 10, 64)
-	if err != nil || n < 0 {
-		return -1
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil
+}
+
+func hasByteRangeSupport(h http.Header) bool {
+	for _, value := range h.Values("Accept-Ranges") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "bytes") {
+				return true
+			}
+		}
 	}
-	return n
+	return false
+}
+
+func hasNonIdentityContentEncoding(h http.Header) bool {
+	for _, value := range h.Values("Content-Encoding") {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token != "" && !strings.EqualFold(token, "identity") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func validateProbeRangeResponse(resp *http.Response, requestedStart, requestedEnd int64) (byteContentRange, error) {
+	cr, err := validatePartialContentRange(resp)
+	if err != nil {
+		return byteContentRange{}, err
+	}
+	if cr.start != requestedStart || cr.end < requestedStart || cr.end > requestedEnd {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range %q does not satisfy requested range bytes=%d-%d", resp.Header.Get("Content-Range"), requestedStart, requestedEnd)
+	}
+	if err := validateContentRangeLength(resp, cr); err != nil {
+		return byteContentRange{}, err
+	}
+	return cr, nil
+}
+
+func validateExactRangeResponse(resp *http.Response, expectedStart, expectedEnd, expectedTotal int64) (byteContentRange, error) {
+	cr, err := validatePartialContentRange(resp)
+	if err != nil {
+		return byteContentRange{}, err
+	}
+	if cr.start != expectedStart || cr.end != expectedEnd {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range %q does not match requested range bytes=%d-%d", resp.Header.Get("Content-Range"), expectedStart, expectedEnd)
+	}
+	if expectedTotal >= 0 && cr.totalKnown && cr.total != expectedTotal {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range total %d does not match expected total %d", cr.total, expectedTotal)
+	}
+	if err := validateContentRangeLength(resp, cr); err != nil {
+		return byteContentRange{}, err
+	}
+	return cr, nil
+}
+
+func validateOpenRangeResponse(resp *http.Response, expectedStart, expectedTotal int64) (byteContentRange, error) {
+	cr, err := validatePartialContentRange(resp)
+	if err != nil {
+		return byteContentRange{}, err
+	}
+	if cr.start != expectedStart {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range %q does not start at requested offset %d", resp.Header.Get("Content-Range"), expectedStart)
+	}
+	if expectedTotal >= 0 && cr.totalKnown && cr.total != expectedTotal {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range total %d does not match expected total %d", cr.total, expectedTotal)
+	}
+	if cr.totalKnown && cr.end != cr.total-1 {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range %q does not complete the open-ended range", resp.Header.Get("Content-Range"))
+	}
+	if err := validateContentRangeLength(resp, cr); err != nil {
+		return byteContentRange{}, err
+	}
+	return cr, nil
+}
+
+func validatePartialContentRange(resp *http.Response) (byteContentRange, error) {
+	if hasNonIdentityContentEncoding(resp.Header) {
+		return byteContentRange{}, newHTTPProtocolError("partial response uses unsupported Content-Encoding %q", resp.Header.Get("Content-Encoding"))
+	}
+	cr, ok := parseByteContentRange(resp.Header.Get("Content-Range"))
+	if !ok || cr.unsatisfied {
+		return byteContentRange{}, newHTTPProtocolError("partial response has invalid Content-Range %q", resp.Header.Get("Content-Range"))
+	}
+	return cr, nil
+}
+
+func validateContentRangeLength(resp *http.Response, cr byteContentRange) error {
+	want := cr.end - cr.start + 1
+	if resp.ContentLength >= 0 && resp.ContentLength != want {
+		return newHTTPProtocolError("partial response Content-Length %d does not match Content-Range length %d", resp.ContentLength, want)
+	}
+	return nil
+}
+
+func completeLengthFromUnsatisfiedRange(resp *http.Response) (int64, bool) {
+	cr, ok := parseByteContentRange(resp.Header.Get("Content-Range"))
+	if !ok || !cr.unsatisfied || !cr.totalKnown {
+		return 0, false
+	}
+	return cr.total, true
+}
+
+func isHTTPTransferSuccess(status int) bool {
+	return status >= 200 && status < 300
+}
+
+func isHTTPBodySuccess(status int) bool {
+	return isHTTPTransferSuccess(status) && status != http.StatusNoContent && status != http.StatusResetContent
 }
 
 func nonNegativeLength(n int64) int64 {
@@ -200,6 +377,10 @@ func isRetryableDownloadError(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var protocolErr *httpProtocolError
+	if errors.As(err, &protocolErr) {
 		return false
 	}
 	var status *httpStatusError

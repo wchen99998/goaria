@@ -38,6 +38,8 @@ func applyRequestOptions(req *http.Request, opts Options) {
 	}
 	if optionBool(opts, "http-accept-gzip") {
 		req.Header.Set("Accept-Encoding", "gzip")
+	} else if req.Header.Get("Accept-Encoding") == "" {
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	if !optionBool(opts, "http-auth-challenge") {
 		if user := optionString(opts, "http-user"); user != "" {
@@ -48,6 +50,32 @@ func applyRequestOptions(req *http.Request, opts Options) {
 			req.SetBasicAuth(user, pass)
 		}
 	}
+}
+
+func applyMetadataRequestOptions(req *http.Request, opts Options) {
+	applyRequestOptions(req, opts)
+	req.Header.Del("Range")
+	req.Header.Set("Accept-Encoding", "identity")
+}
+
+func applyRangeRequestOptions(req *http.Request, opts Options, rangeValue string) {
+	applyRequestOptions(req, opts)
+	req.Header.Set("Range", rangeValue)
+	req.Header.Set("Accept-Encoding", "identity")
+}
+
+func applyIfRange(req *http.Request, meta remoteMeta) {
+	if etag := strongETag(meta.ETag); etag != "" {
+		req.Header.Set("If-Range", etag)
+	}
+}
+
+func strongETag(etag string) string {
+	etag = strings.TrimSpace(etag)
+	if etag == "" || strings.HasPrefix(strings.ToLower(etag), "w/") {
+		return ""
+	}
+	return etag
 }
 
 func basicAuthCredentials(req *http.Request, opts Options) (string, string, bool) {
@@ -86,7 +114,7 @@ func applyConditionalHeaders(req *http.Request, opts Options, path string) {
 }
 
 func responseReader(resp *http.Response, opts Options) (io.Reader, func(), error) {
-	if optionBool(opts, "http-accept-gzip") && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+	if responseBodyDecoded(resp, opts) {
 		zr, err := gzip.NewReader(resp.Body)
 		if err != nil {
 			return nil, func() {}, err
@@ -96,8 +124,17 @@ func responseReader(resp *http.Response, opts Options) (io.Reader, func(), error
 	return resp.Body, func() {}, nil
 }
 
-func metaFromResponse(resp *http.Response, original string) remoteMeta {
+func responseBodyDecoded(resp *http.Response, opts Options) bool {
+	return optionBool(opts, "http-accept-gzip") && strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip")
+}
+
+func metaFromResponse(resp *http.Response, original string, opts Options) remoteMeta {
 	length := nonNegativeLength(resp.ContentLength)
+	acceptRange := hasByteRangeSupport(resp.Header)
+	if responseBodyDecoded(resp, opts) {
+		length = 0
+		acceptRange = false
+	}
 	filename := filenameFromResponse(resp, original)
 	finalURI := original
 	if resp.Request != nil && resp.Request.URL != nil {
@@ -105,10 +142,11 @@ func metaFromResponse(resp *http.Response, original string) remoteMeta {
 	}
 	return remoteMeta{
 		Length:       length,
-		AcceptRange:  strings.Contains(strings.ToLower(resp.Header.Get("Accept-Ranges")), "bytes"),
+		AcceptRange:  acceptRange,
 		FinalURI:     finalURI,
 		Filename:     filename,
 		LastModified: resp.Header.Get("Last-Modified"),
+		ETag:         resp.Header.Get("ETag"),
 	}
 }
 

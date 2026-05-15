@@ -1078,6 +1078,36 @@ func TestAddTorrentURLEnforcesMaxTorrentSize(t *testing.T) {
 	}
 }
 
+func TestAddTorrentURLRejectsPartialHTTPResponse(t *testing.T) {
+	payload := []byte("partial torrent bytes")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(payload)-1, len(payload)+10))
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	const gid = "4444444444444444"
+	_, err = engine.AddTorrent(server.URL+"/file.torrent", nil, Options{"gid": gid, "pause": "true"}, nil)
+	if err == nil {
+		t.Fatal("AddTorrent accepted partial HTTP torrent metadata response")
+	}
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusPartialContent {
+		t.Fatalf("AddTorrent error = %v, want 206 status error", err)
+	}
+	if _, err := engine.TellStatus(gid, []string{"status"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("TellStatus after partial torrent = %v, want ErrNotFound", err)
+	}
+}
+
 func magnetFixtureURI() string {
 	return "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=fixture"
 }

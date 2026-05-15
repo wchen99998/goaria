@@ -208,7 +208,7 @@ func (e *Engine) fetchTorrentURLOnce(ctx context.Context, raw string, opts Optio
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if !isHTTPBodySuccess(resp.StatusCode) || resp.StatusCode == http.StatusPartialContent {
 		return nil, &httpStatusError{Method: http.MethodGet, URL: raw, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 	if resp.ContentLength > maxSize {

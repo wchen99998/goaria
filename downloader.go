@@ -71,6 +71,7 @@ type remoteMeta struct {
 	FinalURI     string
 	Filename     string
 	LastModified string
+	ETag         string
 	NotModified  bool
 }
 
@@ -367,7 +368,7 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 		if err != nil {
 			return remoteMeta{}, err
 		}
-		applyRequestOptions(req, opts)
+		applyMetadataRequestOptions(req, opts)
 		applyConditionalHeaders(req, opts, conditionalPath)
 		resp, err := e.do(req, opts)
 		if err == nil {
@@ -375,8 +376,8 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 			if resp.StatusCode == http.StatusNotModified {
 				return notModifiedMeta(rawURI, conditionalPath), nil
 			}
-			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				meta := metaFromResponse(resp, rawURI)
+			if isHTTPTransferSuccess(resp.StatusCode) {
+				meta := metaFromResponse(resp, rawURI, opts)
 				if resp.ContentLength >= 0 {
 					return meta, nil
 				}
@@ -392,8 +393,7 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 	if err != nil {
 		return remoteMeta{}, err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", metadataProbeRangeEnd))
-	applyRequestOptions(req, opts)
+	applyRangeRequestOptions(req, opts, fmt.Sprintf("bytes=0-%d", metadataProbeRangeEnd))
 	applyConditionalHeaders(req, opts, conditionalPath)
 	resp, err := e.do(req, opts)
 	if err != nil {
@@ -406,20 +406,37 @@ func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditi
 	if resp.StatusCode == http.StatusNotModified {
 		return notModifiedMeta(rawURI, conditionalPath), nil
 	}
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		if total, ok := completeLengthFromUnsatisfiedRange(resp); ok {
+			meta := metaFromResponse(resp, rawURI, opts)
+			meta.Length = total
+			meta.AcceptRange = true
+			return meta, nil
+		}
+	}
+	if !isHTTPTransferSuccess(resp.StatusCode) {
 		if headMetaOK {
 			return headMeta, nil
 		}
 		return remoteMeta{}, &httpStatusError{Method: http.MethodGet, URL: rawURI, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
-	meta := metaFromResponse(resp, rawURI)
+	meta := metaFromResponse(resp, rawURI, opts)
 	if resp.StatusCode == http.StatusPartialContent {
+		cr, err := validateProbeRangeResponse(resp, 0, metadataProbeRangeEnd)
+		if err != nil {
+			if headMetaOK {
+				return headMeta, nil
+			}
+			return remoteMeta{}, err
+		}
 		meta.AcceptRange = true
-		if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
-			meta.Length = total
+		if cr.totalKnown {
+			meta.Length = cr.total
 		} else {
 			meta.Length = 0
 		}
+	} else {
+		meta.AcceptRange = false
 	}
 	return meta, nil
 }
@@ -452,7 +469,7 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 		wg.Add(1)
 		go func(r chunkRange) {
 			defer wg.Done()
-			errCh <- e.downloadRangeWithRetries(ctx, d, meta.FinalURI, path, opts, r, limiter, tracker, maxTries, retryWait)
+			errCh <- e.downloadRangeWithRetries(ctx, d, meta, path, opts, r, limiter, tracker, maxTries, retryWait)
 		}(ch)
 	}
 	wg.Wait()
@@ -466,13 +483,13 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 	return nil
 }
 
-func (e *Engine) downloadRangeWithRetries(ctx context.Context, d *Download, rawURI, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker, maxTries int, retryWait time.Duration) error {
+func (e *Engine) downloadRangeWithRetries(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker, maxTries int, retryWait time.Duration) error {
 	var lastErr error
 	for attempt := 0; maxTries == 0 || attempt < maxTries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := e.downloadRange(ctx, d, rawURI, path, opts, r, limiter, tracker)
+		err := e.downloadRange(ctx, d, meta, path, opts, r, limiter, tracker)
 		if err == nil {
 			return nil
 		}
@@ -497,26 +514,24 @@ func isRetryableRangeSetupError(err error) bool {
 	return isRetryableDownloadError(err)
 }
 
-func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURI, nil)
+func (e *Engine) downloadRange(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, meta.FinalURI, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.start, r.end))
-	applyRequestOptions(req, opts)
+	applyRangeRequestOptions(req, opts, fmt.Sprintf("bytes=%d-%d", r.start, r.end))
+	applyIfRange(req, meta)
 	resp, err := e.do(req, opts)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent {
-		return &httpStatusError{Method: http.MethodGet, URL: rawURI, StatusCode: resp.StatusCode, Status: fmt.Sprintf("range %d-%d: %s", r.start, r.end, resp.Status)}
+		return &httpStatusError{Method: http.MethodGet, URL: meta.FinalURI, StatusCode: resp.StatusCode, Status: fmt.Sprintf("range %d-%d: %s", r.start, r.end, resp.Status)}
 	}
-	body, closeBody, err := responseReader(resp, opts)
-	if err != nil {
+	if _, err := validateExactRangeResponse(resp, r.start, r.end, -1); err != nil {
 		return err
 	}
-	defer closeBody()
 	file, err := os.OpenFile(path, os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -525,7 +540,7 @@ func (e *Engine) downloadRange(ctx context.Context, d *Download, rawURI, path st
 	if _, err := file.Seek(r.start, io.SeekStart); err != nil {
 		return err
 	}
-	if err := copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker); err != nil {
+	if err := copyExactWithProgress(ctx, file, resp.Body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), r.end-r.start+1, tracker); err != nil {
 		return &rangeBodyError{err: err}
 	}
 	return nil
@@ -555,17 +570,26 @@ func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMet
 		return err
 	}
 	if start > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+		applyRangeRequestOptions(req, opts, fmt.Sprintf("bytes=%d-", start))
+		applyIfRange(req, meta)
+	} else {
+		applyRequestOptions(req, opts)
 	}
-	applyRequestOptions(req, opts)
 	resp, err := e.do(req, opts)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if start > 0 && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		if total, ok := completeLengthFromUnsatisfiedRange(resp); ok && total == start && (meta.Length <= 0 || total == meta.Length) {
+			d.resetSingleProgress(total, total)
+			return nil
+		}
+	}
+	if !isHTTPTransferSuccess(resp.StatusCode) || !isHTTPBodySuccess(resp.StatusCode) {
 		return &httpStatusError{Method: http.MethodGet, URL: meta.FinalURI, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
+	rangeLength := int64(-1)
 	if start > 0 && resp.StatusCode != http.StatusPartialContent {
 		start = 0
 		if err := file.Truncate(0); err != nil {
@@ -574,17 +598,47 @@ func (e *Engine) downloadSingle(ctx context.Context, d *Download, meta remoteMet
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
+	} else if start > 0 {
+		cr, err := validateOpenRangeResponse(resp, start, meta.Length)
+		if err != nil {
+			return err
+		}
+		rangeLength = cr.end - cr.start + 1
+	} else if resp.StatusCode == http.StatusPartialContent {
+		return newHTTPProtocolError("unexpected partial response without an internal Range request")
+	} else {
+		respMeta := metaFromResponse(resp, meta.FinalURI, opts)
+		if resp.ContentLength >= 0 || responseBodyDecoded(resp, opts) || meta.Length <= 0 {
+			meta.Length = respMeta.Length
+		}
+		meta.LastModified = respMeta.LastModified
+		meta.FinalURI = respMeta.FinalURI
+		meta.AcceptRange = respMeta.AcceptRange
+		d.setMetadata(meta, path)
 	}
 	d.resetSingleProgress(meta.Length, start)
 	d.setConnections(1)
-	body, closeBody, err := responseReader(resp, opts)
-	if err != nil {
-		d.setConnections(0)
-		return err
+	var body io.Reader = resp.Body
+	closeBody := func() {}
+	if rangeLength < 0 {
+		var err error
+		body, closeBody, err = responseReader(resp, opts)
+		if err != nil {
+			d.setConnections(0)
+			return err
+		}
 	}
 	defer closeBody()
 	tracker := startDownloadSpeedTracker(ctx, d)
-	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker)
+	if rangeLength >= 0 {
+		err = copyExactWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), rangeLength, tracker)
+	} else {
+		var n int64
+		n, err = copyCountingWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker)
+		if err == nil && !responseBodyDecoded(resp, opts) && meta.Length > 0 && n != meta.Length {
+			err = bodyLengthMismatchError(n, meta.Length)
+		}
+	}
 	tracker.stopAndWait()
 	d.setConnections(0)
 	return err
@@ -626,9 +680,10 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 		return remoteMeta{}, "", err
 	}
 	if start > 0 {
-		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
+		applyRangeRequestOptions(req, opts, fmt.Sprintf("bytes=%d-", start))
+	} else {
+		applyRequestOptions(req, opts)
 	}
-	applyRequestOptions(req, opts)
 	applyConditionalHeaders(req, opts, provisionalPath)
 	resp, err := e.do(req, opts)
 	if err != nil {
@@ -648,7 +703,20 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 		d.setMetadata(meta, provisionalPath)
 		return meta, provisionalPath, nil
 	}
-	if resp.StatusCode >= 400 {
+	if start > 0 && resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		if total, ok := completeLengthFromUnsatisfiedRange(resp); ok && total == start {
+			if createdNew {
+				_ = file.Close()
+				_ = os.Remove(provisionalPath)
+			}
+			meta := metaFromResponse(resp, rawURI, opts)
+			meta.Length = total
+			meta.AcceptRange = true
+			d.setMetadata(meta, provisionalPath)
+			return meta, provisionalPath, nil
+		}
+	}
+	if !isHTTPTransferSuccess(resp.StatusCode) || !isHTTPBodySuccess(resp.StatusCode) {
 		if createdNew {
 			_ = file.Close()
 			_ = os.Remove(provisionalPath)
@@ -656,11 +724,28 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 		return remoteMeta{}, "", &httpStatusError{Method: http.MethodGet, URL: rawURI, StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
-	meta := metaFromResponse(resp, rawURI)
+	meta := metaFromResponse(resp, rawURI, opts)
+	rangeLength := int64(-1)
 	if resp.StatusCode == http.StatusPartialContent {
+		if start == 0 {
+			if createdNew {
+				_ = file.Close()
+				_ = os.Remove(provisionalPath)
+			}
+			return remoteMeta{}, "", newHTTPProtocolError("unexpected partial response without an internal Range request")
+		}
+		cr, err := validateOpenRangeResponse(resp, start, -1)
+		if err != nil {
+			if createdNew {
+				_ = file.Close()
+				_ = os.Remove(provisionalPath)
+			}
+			return remoteMeta{}, "", err
+		}
+		rangeLength = cr.end - cr.start + 1
 		meta.AcceptRange = true
-		if total := parseContentRangeTotal(resp.Header.Get("Content-Range")); total >= 0 {
-			meta.Length = total
+		if cr.totalKnown {
+			meta.Length = cr.total
 		}
 	}
 	outPath := provisionalPath
@@ -707,17 +792,30 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 	d.setMetadata(meta, outPath)
 	d.resetSingleProgress(meta.Length, start)
 	d.setConnections(1)
-	body, closeBody, err := responseReader(resp, opts)
-	if err != nil {
-		d.setConnections(0)
-		if createdNew {
-			_ = os.Remove(outPath)
+	var body io.Reader = resp.Body
+	closeBody := func() {}
+	if rangeLength < 0 {
+		var err error
+		body, closeBody, err = responseReader(resp, opts)
+		if err != nil {
+			d.setConnections(0)
+			if createdNew {
+				_ = os.Remove(outPath)
+			}
+			return remoteMeta{}, "", err
 		}
-		return remoteMeta{}, "", err
 	}
 	defer closeBody()
 	tracker := startDownloadSpeedTracker(ctx, d)
-	err = copyWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker)
+	if rangeLength >= 0 {
+		err = copyExactWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), rangeLength, tracker)
+	} else {
+		var n int64
+		n, err = copyCountingWithProgress(ctx, file, body, d, limiter, optionBytes(opts, "lowest-speed-limit", 0), resp.ContentLength, tracker)
+		if err == nil && !responseBodyDecoded(resp, opts) && meta.Length > 0 && n != meta.Length {
+			err = bodyLengthMismatchError(n, meta.Length)
+		}
+	}
 	tracker.stopAndWait()
 	d.setConnections(0)
 	if err != nil {
@@ -728,6 +826,42 @@ func (e *Engine) downloadSingleWithGETProbe(ctx context.Context, d *Download, ra
 
 func canCreateSingleDestinationBeforeGET(opts Options, out string) bool {
 	return out != "" && optionBool(opts, "continue") && !optionBool(opts, "conditional-get")
+}
+
+type countingWriter struct {
+	dst io.Writer
+	n   int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+func copyCountingWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, contentLength int64, tracker *downloadSpeedTracker) (int64, error) {
+	counting := &countingWriter{dst: dst}
+	err := copyWithProgress(ctx, counting, src, d, limiter, lowestSpeed, contentLength, tracker)
+	return counting.n, err
+}
+
+func copyExactWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, expected int64, tracker *downloadSpeedTracker) error {
+	limited := &io.LimitedReader{R: src, N: expected}
+	n, err := copyCountingWithProgress(ctx, dst, limited, d, limiter, lowestSpeed, expected, tracker)
+	if err != nil {
+		return err
+	}
+	if n != expected || limited.N != 0 {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func bodyLengthMismatchError(got, want int64) error {
+	if got < want {
+		return io.ErrUnexpectedEOF
+	}
+	return newHTTPProtocolError("response body length %d does not match expected length %d", got, want)
 }
 
 func copyWithProgress(ctx context.Context, dst io.Writer, src io.Reader, d *Download, limiter *rateLimiter, lowestSpeed int64, contentLength int64, tracker *downloadSpeedTracker) error {

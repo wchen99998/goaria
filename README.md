@@ -159,6 +159,7 @@ The test suite includes normal unit/integration tests, race tests, deterministic
 
 ```sh
 make test
+make e2e
 make race
 make chaos
 make chaos10x
@@ -168,6 +169,8 @@ make profile-scale
 make fuzz
 make fuzz-hour
 ```
+
+`make e2e` runs the standalone JSON-RPC end-to-end suite from the nested `e2e` module. It builds and spawns the `goaria` daemon as a child process, drives the public JSON-RPC endpoint over HTTP GET, HTTP POST, JSONP, batch requests, `system.multicall`, and WebSocket, and audits the E2E method and option coverage against `schemas/aria2-jsonrpc.schema.json` plus `e2e/coverage_manifest.json`. The suite also checks observable behavior and side effects, including downloaded file bytes and mtimes, source-server request headers, URI mutation, queue ordering, removal/purge state, and session-file restoration. To test a prebuilt daemon binary instead of building from source, set `GOARIA_BIN=/path/to/goaria` before running `cd e2e && go test ./...`.
 
 Chaos coverage intentionally injects mid-stream connection drops, transient 503 range failures, retries over multipart downloads, and proxy routing scenarios.
 

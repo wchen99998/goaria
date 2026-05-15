@@ -1,7 +1,10 @@
-.PHONY: test race chaos chaos10x protocol scale profile-scale live-chaos fuzz fuzz-hour build
+.PHONY: test e2e race chaos chaos10x protocol scale profile-scale live-chaos fuzz fuzz-hour build
 
 test:
 	go test ./...
+
+e2e:
+	cd e2e && go test ./...
 
 race:
 	go test -race ./...

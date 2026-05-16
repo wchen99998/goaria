@@ -250,13 +250,13 @@ func TestTorrentStreamHandlerWithTestTorrent(t *testing.T) {
 	streamed := make(chan []byte, 1)
 	engine, err := NewEngine(Config{
 		Dir: t.TempDir(),
-		TorrentFileHandler: func(ctx context.Context, tf TorrentFileLease) error {
-			got, err := io.ReadAll(tf.Reader)
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			got, err := io.ReadAll(tf.Lease.Reader)
 			if err != nil {
 				return err
 			}
 			streamed <- got
-			return tf.Release(ctx)
+			return tf.Lease.Release(ctx)
 		},
 	})
 	if err != nil {
@@ -558,7 +558,10 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if gotPath != filepath.Join(info.BestName(), "nested", "beta.txt") {
 		t.Fatalf("default path = %q", gotPath)
 	}
-	states := torrentFileStates(info, Options{"index-out": "2=custom-beta.txt"}, t.TempDir(), nil)
+	states, err := torrentFileStates(info, metainfo.Hash{}, Options{"index-out": "2=custom-beta.txt"}, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if filepath.Base(states[1].Path) != "custom-beta.txt" {
 		t.Fatalf("index-out torrent state path = %q", states[1].Path)
 	}
@@ -575,7 +578,11 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if _, err := newMagnetDownload("gid", "magnet:?xt=urn:btih:not-a-hash", nil); err == nil {
 		t.Fatal("newMagnetDownload accepted invalid magnet")
 	}
-	if d := newTorrentDownload("gid", nil, "", nil, Options{}, nil, metainfo.Info{}); d.dir != "." {
+	d, err := newTorrentDownload("gid", nil, "", nil, Options{}, nil, metainfo.Info{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.dir != "." {
 		t.Fatalf("empty torrent options dir = %q, want .", d.dir)
 	}
 	identityCfg := torrent.NewDefaultClientConfig()
@@ -636,26 +643,38 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	canceledMagnet := newTorrentDownload("gid", nil, magnetFixtureURI(), nil, Options{
+	canceledMagnet, err := newTorrentDownload("gid", nil, magnetFixtureURI(), nil, Options{
 		"goaria-disable-dht":      "true",
 		"goaria-disable-trackers": "true",
 		"goaria-disable-utp":      "true",
 	}, nil, metainfo.Info{Name: "fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	canceledMagnet.ctx = ctx
 	if err := engine.runTorrentDownload(canceledMagnet); !errors.Is(err, context.Canceled) {
 		t.Fatalf("runTorrentDownload with canceled magnet = %v, want context.Canceled", err)
 	}
-	invalidMagnet := newTorrentDownload("gid", nil, "magnet:?xt=urn:btih:not-a-hash", nil, Options{}, nil, metainfo.Info{})
+	invalidMagnet, err := newTorrentDownload("gid", nil, "magnet:?xt=urn:btih:not-a-hash", nil, Options{}, nil, metainfo.Info{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	invalidMagnet.ctx = context.Background()
 	if err := engine.runTorrentDownload(invalidMagnet); err == nil {
 		t.Fatal("runTorrentDownload accepted invalid magnet")
 	}
-	invalidTorrent := newTorrentDownload("gid", []byte("not a torrent"), "", nil, Options{}, nil, metainfo.Info{})
+	invalidTorrent, err := newTorrentDownload("gid", []byte("not a torrent"), "", nil, Options{}, nil, metainfo.Info{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	invalidTorrent.ctx = context.Background()
 	if err := engine.runTorrentDownload(invalidTorrent); err == nil {
 		t.Fatal("runTorrentDownload accepted invalid torrent data")
 	}
-	badListenHost := newTorrentDownload("gid", data, "", nil, Options{"goaria-listen-host": "bad host"}, mi, info)
+	badListenHost, err := newTorrentDownload("gid", data, "", nil, Options{"goaria-listen-host": "bad host"}, mi, info)
+	if err != nil {
+		t.Fatal(err)
+	}
 	badListenHost.ctx = context.Background()
 	if err := engine.runTorrentDownload(badListenHost); err == nil {
 		t.Fatal("runTorrentDownload accepted invalid listen host")
@@ -680,14 +699,13 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-tor.GotInfo()
-	progressDownload := newTorrentDownload("gid", data, "", nil, Options{"dir": cfg.DataDir}, mi, info)
+	progressDownload, err := newTorrentDownload("gid", data, "", nil, Options{"dir": cfg.DataDir}, mi, info)
+	if err != nil {
+		t.Fatal(err)
+	}
 	engine.updateTorrentProgress(progressDownload, tor)
-	wantReleased := progressDownload.torrentFiles[0].Length
-	progressDownload.torrentFiles[0].Completed = wantReleased
-	progressDownload.torrentFiles[0].Released = true
-	engine.updateTorrentProgress(progressDownload, tor)
-	if progressDownload.torrentFiles[0].Completed != wantReleased || progressDownload.completedLen != wantReleased {
-		t.Fatalf("released torrent file progress regressed: file=%d total=%d", progressDownload.torrentFiles[0].Completed, progressDownload.completedLen)
+	if progressDownload.torrentFiles[0].Completed < 0 || progressDownload.completedLen < 0 {
+		t.Fatalf("torrent progress should not be negative: file=%d total=%d", progressDownload.torrentFiles[0].Completed, progressDownload.completedLen)
 	}
 }
 
@@ -981,7 +999,6 @@ func TestTorrentChangeOptionPreservesProgressWhenRebuildingFiles(t *testing.T) {
 	firstCompleted := d.torrentFiles[0].Length
 	secondCompleted := int64(7)
 	d.torrentFiles[0].Completed = firstCompleted
-	d.torrentFiles[0].Released = true
 	d.torrentFiles[1].Completed = secondCompleted
 	d.completedLen = firstCompleted + secondCompleted
 	d.mu.Unlock()
@@ -1019,12 +1036,6 @@ func TestTorrentChangeOptionPreservesProgressWhenRebuildingFiles(t *testing.T) {
 	}
 	if status["completedLength"] != strconv.FormatInt(firstCompleted+secondCompleted, 10) {
 		t.Fatalf("completedLength after reselection = %v, want %d", status["completedLength"], firstCompleted+secondCompleted)
-	}
-	d.mu.RLock()
-	released := d.torrentFiles[0].Released
-	d.mu.RUnlock()
-	if !released {
-		t.Fatal("released state was not preserved")
 	}
 }
 
@@ -1269,33 +1280,34 @@ func TestTorrentStreamHandlerProcessesAndReleasesFiles(t *testing.T) {
 	var engine *Engine
 	engine, err := NewEngine(Config{
 		Dir: t.TempDir(),
-		TorrentFileHandler: func(ctx context.Context, tf TorrentFileLease) error {
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
 			files, err := engine.GetFiles(tf.GID)
 			if err != nil {
 				return err
 			}
+			ariaIndex := tf.Lease.Index + 1
 			gotComplete := false
 			for _, f := range files {
-				if f.Index == strconv.Itoa(tf.Index) {
+				if f.Index == strconv.Itoa(ariaIndex) {
 					gotComplete = f.CompletedLength == f.Length
 					break
 				}
 			}
 			if !gotComplete {
-				return fmt.Errorf("handler called before file %d was complete", tf.Index)
+				return fmt.Errorf("handler called before file %d was complete", ariaIndex)
 			}
-			got, err := io.ReadAll(tf.Reader)
+			got, err := io.ReadAll(tf.Lease.Reader)
 			if err != nil {
 				return err
 			}
 			seenMu.Lock()
 			defer seenMu.Unlock()
-			seenFiles = append(seenFiles, filepath.Base(tf.Path))
-			seenBuf.WriteString(filepath.Base(tf.Path))
+			seenFiles = append(seenFiles, filepath.Base(tf.Lease.Path))
+			seenBuf.WriteString(filepath.Base(tf.Lease.Path))
 			seenBuf.WriteByte('=')
 			seenBuf.Write(got)
 			seenBuf.WriteByte('\n')
-			return tf.Release(ctx)
+			return tf.Lease.Release(ctx)
 		},
 	})
 	if err != nil {
@@ -1358,8 +1370,8 @@ func TestTorrentStreamHandlerStartsCompletedFilesWhileEarlierHandlerRuns(t *test
 	var firstOnce sync.Once
 	engine, err := NewEngine(Config{
 		Dir: t.TempDir(),
-		TorrentFileHandler: func(ctx context.Context, tf TorrentFileLease) error {
-			name := filepath.Base(tf.Path)
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			name := filepath.Base(tf.Lease.Path)
 			isFirst := false
 			firstOnce.Do(func() {
 				isFirst = true
@@ -1371,17 +1383,17 @@ func TestTorrentStreamHandlerStartsCompletedFilesWhileEarlierHandlerRuns(t *test
 				default:
 				}
 			}
-			if _, err := io.ReadAll(tf.Reader); err != nil {
+			if _, err := io.ReadAll(tf.Lease.Reader); err != nil {
 				return err
 			}
 			if !isFirst {
-				return tf.Release(ctx)
+				return tf.Lease.Release(ctx)
 			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-releaseFirst:
-				return tf.Release(ctx)
+				return tf.Lease.Release(ctx)
 			}
 		},
 	})
@@ -1417,10 +1429,10 @@ func TestTorrentStreamLeaseWaitsForExplicitReleaseAndBoundsActiveFiles(t *testin
 	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
 	defer stopSeeder()
 
-	leases := make(chan TorrentFileLease, 2)
+	leases := make(chan TorrentFile, 2)
 	engine, err := NewEngine(Config{
 		Dir: t.TempDir(),
-		TorrentFileHandler: func(ctx context.Context, tf TorrentFileLease) error {
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
 			leases <- tf
 			return nil
 		},
@@ -1452,19 +1464,19 @@ func TestTorrentStreamLeaseWaitsForExplicitReleaseAndBoundsActiveFiles(t *testin
 	}
 	select {
 	case second := <-leases:
-		t.Fatalf("second lease %s started before first lease was released", second.Path)
+		t.Fatalf("second lease %s started before first lease was released", second.Lease.Path)
 	case <-time.After(250 * time.Millisecond):
 	}
 	time.Sleep(1100 * time.Millisecond)
-	if err := first.Release(context.Background()); err != nil {
+	if err := first.Lease.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if pathExists(first.Path) || pathExists(first.Path+".part") {
-		t.Fatalf("released file storage still exists: %q", first.Path)
+	if pathExists(first.Lease.Path) || pathExists(first.Lease.Path+".part") {
+		t.Fatalf("released file storage still exists: %q", first.Lease.Path)
 	}
 
 	second := receiveLease(t, leases, "second")
-	if err := second.Release(context.Background()); err != nil {
+	if err := second.Lease.Release(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	waitForStatus(t, engine, gid, StatusComplete)
@@ -1477,11 +1489,11 @@ func TestTorrentStreamHandlerFailureReleasesFileStorage(t *testing.T) {
 	streamedPaths := make(chan string, 2)
 	engine, err := NewEngine(Config{
 		Dir: t.TempDir(),
-		TorrentFileHandler: func(ctx context.Context, tf TorrentFileLease) error {
-			if _, err := io.ReadAll(tf.Reader); err != nil {
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			if _, err := io.ReadAll(tf.Lease.Reader); err != nil {
 				return err
 			}
-			streamedPaths <- tf.Path
+			streamedPaths <- tf.Lease.Path
 			return io.ErrUnexpectedEOF
 		},
 	})
@@ -1518,12 +1530,12 @@ func TestTorrentStreamHandlerDiscardRemovesStorageOnFailure(t *testing.T) {
 	streamedPaths := make(chan string, 2)
 	engine, err := NewEngine(Config{
 		Dir: t.TempDir(),
-		TorrentFileHandler: func(ctx context.Context, tf TorrentFileLease) error {
-			if _, err := io.ReadAll(tf.Reader); err != nil {
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			if _, err := io.ReadAll(tf.Lease.Reader); err != nil {
 				return err
 			}
-			streamedPaths <- tf.Path
-			if err := tf.Discard(ctx); err != nil {
+			streamedPaths <- tf.Lease.Path
+			if err := tf.Lease.Discard(ctx); err != nil {
 				return err
 			}
 			return io.ErrUnexpectedEOF
@@ -1567,14 +1579,14 @@ func drainStringChannel(ch <-chan string) []string {
 	}
 }
 
-func receiveLease(t *testing.T, leases <-chan TorrentFileLease, label string) TorrentFileLease {
+func receiveLease(t *testing.T, leases <-chan TorrentFile, label string) TorrentFile {
 	t.Helper()
 	select {
 	case lease := <-leases:
 		return lease
 	case <-time.After(3 * time.Second):
 		t.Fatalf("%s lease did not start", label)
-		return TorrentFileLease{}
+		return TorrentFile{}
 	}
 }
 

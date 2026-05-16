@@ -79,7 +79,10 @@ func (e *Engine) loadSession(path string) error {
 			if _, _, err := torrentSelectionAndIndexOut(info, merged); err != nil {
 				return fmt.Errorf("%s:%d: %w", path, item.line, err)
 			}
-			d = newTorrentDownload(gid, data, "", webseeds, merged, mi, info)
+			d, err = newTorrentDownload(gid, data, "", webseeds, merged, mi, info)
+			if err != nil {
+				return fmt.Errorf("%s:%d: %w", path, item.line, err)
+			}
 		} else if len(item.uris) == 1 && isMagnetURI(item.uris[0]) {
 			var err error
 			d, err = newMagnetDownload(gid, item.uris[0], merged)

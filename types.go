@@ -2,16 +2,16 @@ package goaria
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"time"
 
+	"github.com/wchen99998/torrent/stream"
 	"go.uber.org/zap"
 )
 
 const (
 	// Version is the goaria package version.
-	Version = "0.2.7"
+	Version = "0.3.0"
 
 	// Aria2CompatVersion is reported through aria2.getVersion.
 	Aria2CompatVersion = "1.37.0"
@@ -50,31 +50,15 @@ type Config struct {
 // the lease is finalized. If the handler returns an error before finalizing the
 // lease, goaria releases the file storage and reports the handler error as the
 // download error.
-type TorrentFileHandler func(context.Context, TorrentFileLease) error
+type TorrentFileHandler func(context.Context, TorrentFile) error
 
-// TorrentFileLease represents one completed torrent file handed to downstream
-// processing. Release or Discard closes Reader, finalizes the torrent file
-// storage, and removes Path. They are safe to call once; repeated calls return
-// the first finalization result.
-type TorrentFileLease struct {
-	GID    string
-	Index  int
-	Path   string
-	Length int64
-
-	// Reader is limited to this file's Length. Downstream code can ignore it and
-	// use Path directly, but the lease must still be finalized.
-	Reader io.ReadCloser
-
-	// Release marks the completed file storage no longer needed.
-	Release func(context.Context) error
-
-	// Discard invalidates the file storage instead of preserving completion.
-	Discard func(context.Context) error
+// TorrentFile represents one completed torrent file handed to downstream
+// processing. Lease owns the file reader and storage lifecycle. Call
+// Lease.Release or Lease.Discard when downstream processing has finished.
+type TorrentFile struct {
+	GID   string
+	Lease *stream.FileLease
 }
-
-// TorrentFile is kept as a compatibility alias for the completed-file lease.
-type TorrentFile = TorrentFileLease
 
 type URIStatus string
 

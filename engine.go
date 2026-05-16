@@ -431,6 +431,8 @@ func (e *Engine) ChangeOption(gid string, opts Options) (string, error) {
 	d.mu.Lock()
 	merged := mergeOptions(d.options, opts)
 	var torrentInfo *torrentMetadataInfo
+	var runtime *torrentRuntime
+	var selectedIndexes []int
 	if d.kind == downloadKindTorrent {
 		if err := validateTorrentExtensionOptions(merged); err != nil {
 			d.mu.Unlock()
@@ -446,10 +448,22 @@ func (e *Engine) ChangeOption(gid string, opts Options) (string, error) {
 	d.dir = optionString(d.options, "dir")
 	d.out = optionString(d.options, "out")
 	if torrentInfo != nil {
-		d.torrentFiles, d.totalLength, d.completedLen = rebuildTorrentFileStatesPreservingProgress(torrentInfo.info, d.options, d.dir, d.uris, d.torrentFiles)
+		var err error
+		d.torrentFiles, d.totalLength, d.completedLen, err = rebuildTorrentFileStatesPreservingProgress(torrentInfo.info, d.options, d.dir, d.uris, d.torrentFiles)
+		if err != nil {
+			d.mu.Unlock()
+			return "", err
+		}
 		d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
+		if d.torrent != nil && d.torrent.selection != nil {
+			runtime = d.torrent
+			selectedIndexes = selectedTorrentFileIndexesFromStates(d.torrentFiles)
+		}
 	}
 	d.mu.Unlock()
+	if runtime != nil {
+		runtime.updateSelection(selectedIndexes)
+	}
 	e.saveSessionBestEffort()
 	return "OK", nil
 }
@@ -480,8 +494,11 @@ func (d *Download) metadataInfoLocked() (*torrentMetadataInfo, error) {
 	return nil, nil
 }
 
-func rebuildTorrentFileStatesPreservingProgress(info metainfo.Info, opts Options, dir string, uris []URIInfo, previous []torrentFileState) ([]torrentFileState, int64, int64) {
-	next := torrentFileStates(info, opts, dir, uris)
+func rebuildTorrentFileStatesPreservingProgress(info metainfo.Info, opts Options, dir string, uris []URIInfo, previous []torrentFileState) ([]torrentFileState, int64, int64, error) {
+	next, err := torrentFileStates(info, metainfo.Hash{}, opts, dir, uris)
+	if err != nil {
+		return nil, 0, 0, err
+	}
 	byIndex := make(map[int]torrentFileState, len(previous))
 	for _, state := range previous {
 		byIndex[state.Index] = state
@@ -490,14 +507,9 @@ func rebuildTorrentFileStatesPreservingProgress(info metainfo.Info, opts Options
 	var completed int64
 	for i := range next {
 		if old, ok := byIndex[next[i].Index]; ok {
-			next[i].Released = old.Released
-			if old.Released {
+			next[i].Completed = old.Completed
+			if next[i].Completed > next[i].Length {
 				next[i].Completed = next[i].Length
-			} else {
-				next[i].Completed = old.Completed
-				if next[i].Completed > next[i].Length {
-					next[i].Completed = next[i].Length
-				}
 			}
 		}
 		if next[i].Selected {
@@ -505,7 +517,7 @@ func rebuildTorrentFileStatesPreservingProgress(info metainfo.Info, opts Options
 			completed += next[i].Completed
 		}
 	}
-	return next, total, completed
+	return next, total, completed, nil
 }
 
 func (e *Engine) GetGlobalOption() map[string]any {

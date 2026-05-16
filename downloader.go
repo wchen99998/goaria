@@ -263,21 +263,22 @@ func (e *Engine) runDownload(d *Download) error {
 
 func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, opts Options) error {
 	split := optionInt(opts, "split", 1)
-	maxConn := optionInt(opts, "max-connection-per-server", split)
 	if split < 1 {
 		split = 1
 	}
+	maxConn := optionInt(opts, "max-connection-per-server", split)
 	if maxConn < 1 {
 		maxConn = 1
 	}
-	concurrency := minInt(split, maxConn)
+	initialConcurrency := minInt(split, maxConn)
+	segmentedRequested := split > 1
 	minSplit := optionBytes(opts, "min-split-size", 1<<20)
 	limit := optionBytes(opts, "max-download-limit", 0)
 	limiter := newRateLimiter(limit)
 	dirOpt := optionString(opts, "dir")
 	outOpt := optionString(opts, "out")
 
-	if canUseSingleGETProbe(opts, concurrency) {
+	if canUseSingleGETProbe(opts, segmentedRequested, initialConcurrency) {
 		meta, outPath, err := e.downloadSingleWithGETProbe(ctx, d, rawURI, opts, dirOpt, outOpt, limiter)
 		if err != nil {
 			return err
@@ -294,7 +295,7 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	provisionalName := filenameFromURI(rawURI)
 	provisionalPath := resolveOutputPath(dirOpt, outOpt, provisionalName, rawURI)
 	probeOpts := opts
-	if concurrency > 1 {
+	if segmentedRequested {
 		probeOpts = transportOptionsForSegmented(opts)
 	}
 	meta, err := e.probe(ctx, rawURI, probeOpts, provisionalPath)
@@ -314,7 +315,7 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	if !optionExplicit(opts, "min-split-size") && segmentedMin < 8<<20 {
 		segmentedMin = 8 << 20
 	}
-	segmented := meta.Length > 0 && meta.AcceptRange && concurrency > 1 && meta.Length >= segmentedMin
+	segmented := meta.Length > 0 && meta.AcceptRange && segmentedRequested && meta.Length >= segmentedMin
 	if selectedPath != "" {
 		outPath = selectedPath
 	} else {
@@ -330,7 +331,7 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	d.setMetadata(meta, outPath)
 	if segmented {
 		opts = transportOptionsForSegmented(opts)
-		chunks := makeChunks(meta.Length, concurrency, minSplit)
+		chunks := makeChunks(meta.Length, split, minSplit)
 		err = e.downloadSegmented(ctx, d, meta, outPath, opts, chunks, limiter)
 	} else {
 		err = e.downloadSingle(ctx, d, meta, outPath, opts, limiter)
@@ -344,11 +345,24 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	return applyRemoteTime(outPath, meta, opts)
 }
 
-func canUseSingleGETProbe(opts Options, concurrency int) bool {
-	if concurrency > 1 || optionBool(opts, "dry-run") {
+func canUseSingleGETProbe(opts Options, segmentedRequested bool, initialConcurrency int) bool {
+	if optionBool(opts, "dry-run") {
 		return false
 	}
-	return optionString(opts, "out") != "" || !optionBool(opts, "continue")
+	useSingleGET := optionString(opts, "out") != "" || !optionBool(opts, "continue")
+	if !segmentedRequested {
+		return useSingleGET
+	}
+	if initialConcurrency > 1 {
+		return false
+	}
+	if optionBool(opts, "http-accept-gzip") {
+		return useSingleGET
+	}
+	if optionString(opts, "out") != "" && optionBool(opts, "continue") {
+		return true
+	}
+	return false
 }
 
 func transportOptionsForSegmented(opts Options) Options {
@@ -457,30 +471,130 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 	tracker := startDownloadSpeedTracker(ctx, d)
 	defer tracker.stopAndWait()
 
-	errCh := make(chan error, len(chunks))
-	var wg sync.WaitGroup
-	maxTries := optionInt(opts, "max-tries", 5)
-	if maxTries < 0 {
-		maxTries = 1
-	}
-	retryWait := time.Duration(optionInt(opts, "retry-wait", 0)) * time.Second
-	d.setConnections(len(chunks))
+	segCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	tasks := make(chan chunkRange, len(chunks))
 	for _, ch := range chunks {
-		wg.Add(1)
-		go func(r chunkRange) {
-			defer wg.Done()
-			errCh <- e.downloadRangeWithRetries(ctx, d, meta, path, opts, r, limiter, tracker, maxTries, retryWait)
-		}(ch)
+		tasks <- ch
 	}
-	wg.Wait()
-	close(errCh)
-	d.setConnections(0)
-	for err := range errCh {
-		if err != nil {
-			return err
+	close(tasks)
+
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	var active atomic.Int64
+	started := 0
+	startWorker := func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-segCtx.Done():
+					return
+				case r, ok := <-tasks:
+					if !ok {
+						return
+					}
+					if err := segCtx.Err(); err != nil {
+						return
+					}
+					rangeOpts := transportOptionsForSegmented(d.optionSnapshot())
+					maxTries := optionInt(rangeOpts, "max-tries", 5)
+					if maxTries < 0 {
+						maxTries = 1
+					}
+					retryWait := time.Duration(optionInt(rangeOpts, "retry-wait", 0)) * time.Second
+					d.setConnections(int(active.Add(1)))
+					err := e.downloadRangeWithRetries(segCtx, d, meta, path, rangeOpts, r, limiter, tracker, maxTries, retryWait)
+					d.setConnections(int(active.Add(-1)))
+					if err != nil {
+						select {
+						case errCh <- err:
+						default:
+						}
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+	startWorkers := func() {
+		target := e.segmentedWorkerLimit(d, opts, len(chunks))
+		for started < target {
+			started++
+			startWorker()
 		}
 	}
-	return nil
+
+	startWorkers()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	ctxDone := ctx.Done()
+	for {
+		select {
+		case <-done:
+			d.setConnections(0)
+			select {
+			case err := <-errCh:
+				return err
+			default:
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return nil
+		case <-ticker.C:
+			startWorkers()
+		case <-ctxDone:
+			cancel()
+			ctxDone = nil
+		}
+	}
+}
+
+func (e *Engine) segmentedWorkerLimit(d *Download, fallback Options, max int) int {
+	if max < 1 {
+		return 0
+	}
+	opts := e.dynamicSegmentedOptionSnapshot(d)
+	if opts == nil {
+		opts = fallback
+	}
+	split := optionInt(opts, "split", optionInt(fallback, "split", 1))
+	if split < 1 {
+		split = 1
+	}
+	maxConn := optionInt(opts, "max-connection-per-server", split)
+	if maxConn < 1 {
+		maxConn = 1
+	}
+	limit := minInt(split, maxConn)
+	if limit > max {
+		limit = max
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
+func (e *Engine) dynamicSegmentedOptionSnapshot(d *Download) Options {
+	opts := d.optionSnapshot()
+	e.mu.RLock()
+	global := cloneOptions(e.global)
+	e.mu.RUnlock()
+	for _, key := range []string{"split", "max-connection-per-server"} {
+		if !optionExplicit(opts, key) {
+			opts[key] = normalizeOptionValue(optionString(global, key))
+		}
+	}
+	return opts
 }
 
 func (e *Engine) downloadRangeWithRetries(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker, maxTries int, retryWait time.Duration) error {

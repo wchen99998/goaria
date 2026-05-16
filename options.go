@@ -140,6 +140,12 @@ func normalizeOptions(in map[string]any) Options {
 	return out
 }
 
+func (d *Download) optionSnapshot() Options {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return cloneOptions(d.options)
+}
+
 func optionValue(opts Options, key string) (any, bool) {
 	if opts == nil {
 		return nil, false

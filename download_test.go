@@ -59,6 +59,51 @@ func TestSegmentedHTTPDownloadCompletes(t *testing.T) {
 	}
 }
 
+func TestDownloadRecreatesCachedDirectory(t *testing.T) {
+	data := []byte("payload")
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "channel")
+	engine, err := NewEngine(Config{Dir: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	first, err := engine.AddURI([]string{src.URL + "/first.bin"}, Options{
+		"dir": dir,
+		"out": "first.bin",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, first, StatusComplete)
+	if err := os.Remove(filepath.Join(dir, "first.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := engine.AddURI([]string{src.URL + "/second.bin"}, Options{
+		"dir": dir,
+		"out": "second.bin",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, second, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "second.bin"), data)
+}
+
 func TestChangeOptionScalesActiveSegmentedDownload(t *testing.T) {
 	runActiveSegmentedConnectionScaleTest(t, func(engine *Engine, gid string) error {
 		_, err := engine.ChangeOption(gid, Options{"max-connection-per-server": "4"})

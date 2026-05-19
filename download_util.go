@@ -289,9 +289,19 @@ func (e *Engine) ensureDownloadDir(dir string) error {
 	e.dirMu.Lock()
 	if _, ok := e.createdDir[dir]; ok {
 		e.dirMu.Unlock()
-		return nil
+		info, err := os.Stat(dir)
+		if err == nil && info.IsDir() {
+			return nil
+		}
+		if err == nil {
+			return fmt.Errorf("%s exists and is not a directory", dir)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	} else {
+		e.dirMu.Unlock()
 	}
-	e.dirMu.Unlock()
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err

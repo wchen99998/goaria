@@ -11,10 +11,7 @@ import (
 )
 
 func applyRequestOptions(req *http.Request, opts Options) {
-	ua := optionString(opts, "user-agent")
-	if ua != "" {
-		req.Header.Set("User-Agent", ua)
-	}
+	headerUserAgent := false
 	for _, h := range optionStringList(opts, "header") {
 		name, value, ok := strings.Cut(h, ":")
 		if !ok {
@@ -24,7 +21,17 @@ func applyRequestOptions(req *http.Request, opts Options) {
 		if name == "" {
 			continue
 		}
-		req.Header.Add(name, strings.TrimSpace(value))
+		value = strings.TrimSpace(value)
+		if strings.EqualFold(name, "User-Agent") {
+			headerUserAgent = true
+			req.Header.Set(name, value)
+			continue
+		}
+		req.Header.Add(name, value)
+	}
+	ua := optionString(opts, "user-agent")
+	if ua != "" && !headerUserAgent {
+		req.Header.Set("User-Agent", ua)
 	}
 	if ref := optionString(opts, "referer"); ref != "" {
 		if ref == "*" {

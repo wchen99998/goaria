@@ -79,6 +79,26 @@ func TestHTTPRequestOptionsAndRemoteTime(t *testing.T) {
 	}
 }
 
+func TestHeaderUserAgentOverridesOptionUserAgent(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://example.test/file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyRequestOptions(req, Options{
+		"user-agent": "goaria/default",
+		"header": []string{
+			"User-Agent: Mozilla/5.0",
+			"X-Goaria-Test: ok",
+		},
+	})
+	if got := req.Header.Values("User-Agent"); len(got) != 1 || got[0] != "Mozilla/5.0" {
+		t.Fatalf("User-Agent values = %#v, want header override only", got)
+	}
+	if got := req.Header.Get("X-Goaria-Test"); got != "ok" {
+		t.Fatalf("X-Goaria-Test = %q", got)
+	}
+}
+
 func TestHTTPAuthChallengeRetriesWithBasicAuth(t *testing.T) {
 	data := []byte("challenge auth")
 	var unauthenticated atomic.Int32

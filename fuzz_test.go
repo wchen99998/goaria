@@ -31,14 +31,14 @@ func FuzzParseContentRangeTotal(f *testing.F) {
 }
 
 func FuzzMakeChunks(f *testing.F) {
-	f.Add(int64(1), 1, int64(1))
-	f.Add(int64(1024), 4, int64(1))
-	f.Add(int64(1024*1024+1), 16, int64(1024))
-	f.Fuzz(func(t *testing.T, total int64, concurrency int, minSplit int64) {
-		if total <= 0 || total > 64<<20 {
+	f.Add(int64(1), int64(1))
+	f.Add(int64(1024), int64(1))
+	f.Add(int64(1024*1024+1), int64(1024))
+	f.Fuzz(func(t *testing.T, total int64, chunkSize int64) {
+		if total <= 0 || total > 64<<20 || chunkSize <= 0 || chunkSize > 64<<20 {
 			t.Skip()
 		}
-		chunks := makeChunks(total, concurrency, minSplit)
+		chunks := makeChunks(total, chunkSize)
 		if len(chunks) == 0 {
 			t.Fatal("no chunks")
 		}

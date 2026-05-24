@@ -479,6 +479,7 @@ func TestSegmentedRangeRequestsUseIdentityEncodingAndSingleRange(t *testing.T) {
 		"split":                     "4",
 		"max-connection-per-server": "4",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
 		"http-accept-gzip":          "true",
 		"header":                    []string{"Range: bytes=1-1", "Accept-Encoding: gzip"},
 	}, nil)
@@ -522,6 +523,7 @@ func TestSegmentedRangeRequestsDoNotUseWeakETagAsIfRange(t *testing.T) {
 		"split":                     "4",
 		"max-connection-per-server": "4",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -563,6 +565,7 @@ func TestSegmentedDownloadRejectsMismatchedContentRange(t *testing.T) {
 		"split":                     "4",
 		"max-connection-per-server": "4",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
 		"max-tries":                 "1",
 	}, nil)
 	if err != nil {

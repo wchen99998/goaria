@@ -159,6 +159,7 @@ func TestChaosSegmentedRetryAndParallelRanges(t *testing.T) {
 		"split":                     "4",
 		"max-connection-per-server": "4",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
 		"max-tries":                 "3",
 	}, nil)
 	if err != nil {

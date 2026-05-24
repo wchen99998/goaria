@@ -72,6 +72,7 @@
     "goaria-disable-trackers": "true",
     "goaria-disable-utp": "true",
     "goaria-exclude-file-ext": ["nfo", "txt"],
+    "goaria-http-segment-size": "50M",
     "goaria-listen-host": "127.0.0.1",
     "goaria-peer-addrs": ["127.0.0.1:1"],
     "goaria-max-torrent-size": "16M",

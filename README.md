@@ -141,7 +141,7 @@ Implemented BitTorrent behaviors include:
 
 Implemented HTTP/S behaviors include:
 
-- segmented range downloads through `split`, `max-connection-per-server`, and `min-split-size`
+- segmented range downloads through fixed-size `goaria-http-segment-size` chunks, with `split`, `max-connection-per-server`, and `min-split-size` controlling concurrency and split eligibility
 - retry and recovery through `max-tries`, `retry-wait`, and `max-file-not-found`
 - resume through `continue=true` when servers support byte ranges
 - queue/session persistence through `save-session`, `aria2.saveSession`, and daemon `-input-file` / `-save-session`

@@ -67,6 +67,7 @@ func TestHTTP2Download(t *testing.T) {
 		"split":                     "2",
 		"max-connection-per-server": "2",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "8K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +96,7 @@ func TestAutoSegmentedDownloadPrefersHTTP1AgainstHTTP2CapableServer(t *testing.T
 		"split":                     "2",
 		"max-connection-per-server": "2",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "8K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -128,6 +130,7 @@ func TestHTTP3Download(t *testing.T) {
 		"split":                     "2",
 		"max-connection-per-server": "2",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "8K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)

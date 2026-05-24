@@ -72,6 +72,7 @@ func runDownload(args []string) error {
 	out := fs.String("out", "", "output filename for a single URL")
 	split := fs.Int("split", 4, "number of pieces per download")
 	connections := fs.Int("max-connection-per-server", 4, "maximum HTTP connections per server")
+	segmentSize := fs.String("http-segment-size", "50M", "HTTP range segment size")
 	httpVersion := fs.String("http-version", "auto", "HTTP version: auto, 1.1, 2, or 3")
 	userAgent := fs.String("user-agent", "", "HTTP User-Agent")
 	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
@@ -101,6 +102,7 @@ func runDownload(args []string) error {
 		opts := goaria.Options{
 			"split":                     fmt.Sprint(*split),
 			"max-connection-per-server": fmt.Sprint(*connections),
+			"goaria-http-segment-size":  *segmentSize,
 			"http-version":              *httpVersion,
 		}
 		if *out != "" && fs.NArg() == 1 && i == 0 {

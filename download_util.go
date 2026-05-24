@@ -313,20 +313,14 @@ func (e *Engine) ensureDownloadDir(dir string) error {
 	return nil
 }
 
-func makeChunks(total int64, concurrency int, minSplit int64) []chunkRange {
-	if concurrency < 1 {
-		concurrency = 1
+func makeChunks(total, chunkSize int64) []chunkRange {
+	if total <= 0 {
+		return nil
 	}
-	if minSplit <= 0 {
-		minSplit = 1 << 20
+	if chunkSize <= 0 {
+		chunkSize = defaultHTTPSegmentSize
 	}
-	maxChunks := int(ceilDivInt64(total, minSplit))
-	if maxChunks < 1 {
-		maxChunks = 1
-	}
-	count := minInt(concurrency, maxChunks)
-	chunkSize := ceilDivInt64(total, int64(count))
-	chunks := make([]chunkRange, 0, count)
+	chunks := make([]chunkRange, 0, int(ceilDivInt64(total, chunkSize)))
 	for start := int64(0); start < total; start += chunkSize {
 		end := start + chunkSize - 1
 		if end >= total {

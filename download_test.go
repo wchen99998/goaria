@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +36,7 @@ func TestSegmentedHTTPDownloadCompletes(t *testing.T) {
 		"split":                     "4",
 		"max-connection-per-server": "4",
 		"min-split-size":            "1",
+		"goaria-http-segment-size":  "64K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +59,165 @@ func TestSegmentedHTTPDownloadCompletes(t *testing.T) {
 	}
 	if status["totalLength"] != status["completedLength"] {
 		t.Fatalf("length mismatch: %#v", status)
+	}
+}
+
+func TestSegmentedHTTPDownloadUsesFixedChunks(t *testing.T) {
+	data := bytes.Repeat([]byte("fixed-chunk-"), 3500)
+	var mu sync.Mutex
+	var gotRanges []chunkRange
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		start, end, ok := parseTestRange(t, r.Header.Get("Range"), int64(len(data)))
+		if !ok {
+			http.Error(w, "expected range request", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		gotRanges = append(gotRanges, chunkRange{start: start, end: end})
+		mu.Unlock()
+		writeRange(w, data, start, end)
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddURI([]string{src.URL + "/fixed.bin"}, Options{
+		"out":                       "fixed.bin",
+		"split":                     "4",
+		"max-connection-per-server": "4",
+		"min-split-size":            "1",
+		"goaria-http-segment-size":  "10K",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "fixed.bin"), data)
+
+	mu.Lock()
+	ranges := append([]chunkRange(nil), gotRanges...)
+	mu.Unlock()
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+	if got, want := len(ranges), int(ceilDivInt64(int64(len(data)), 10*1024)); got != want {
+		t.Fatalf("range count = %d, want %d; ranges=%#v", got, want, ranges)
+	}
+	for i, r := range ranges {
+		wantStart := int64(i * 10 * 1024)
+		wantEnd := wantStart + 10*1024 - 1
+		if wantEnd >= int64(len(data)) {
+			wantEnd = int64(len(data)) - 1
+		}
+		if r.start != wantStart || r.end != wantEnd {
+			t.Fatalf("range[%d] = %d-%d, want %d-%d", i, r.start, r.end, wantStart, wantEnd)
+		}
+	}
+}
+
+func TestSegmentedHTTPDownloadAdaptsRangeThrottle(t *testing.T) {
+	for _, statusCode := range []int{http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+			data := bytes.Repeat([]byte("adaptive-range-"), 32*1024)
+			var activeRanges atomic.Int32
+			var throttled atomic.Int32
+			src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				setDownloadHeaders(w, data)
+				if r.Method == http.MethodHead {
+					return
+				}
+				rng := r.Header.Get("Range")
+				if rng == "" {
+					http.Error(w, "expected range request", http.StatusBadRequest)
+					return
+				}
+				current := activeRanges.Add(1)
+				defer activeRanges.Add(-1)
+				if current > 2 {
+					throttled.Add(1)
+					http.Error(w, http.StatusText(statusCode), statusCode)
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+				start, end, _ := parseTestRange(t, rng, int64(len(data)))
+				writeRange(w, data, start, end)
+			}))
+			defer src.Close()
+
+			dir := t.TempDir()
+			engine, err := NewEngine(Config{Dir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close(context.Background())
+			gid, err := engine.AddURI([]string{src.URL + "/adaptive.bin"}, Options{
+				"out":                       "adaptive.bin",
+				"split":                     "5",
+				"max-connection-per-server": "5",
+				"min-split-size":            "1",
+				"goaria-http-segment-size":  "16K",
+				"max-tries":                 "20",
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForStatus(t, engine, gid, StatusComplete)
+			assertFileEquals(t, filepath.Join(dir, "adaptive.bin"), data)
+			if throttled.Load() == 0 {
+				t.Fatal("server did not throttle any range requests")
+			}
+		})
+	}
+}
+
+func TestSegmentedHTTPDownloadDoesNotAdaptUnauthorized(t *testing.T) {
+	data := bytes.Repeat([]byte("unauthorized-"), 32*1024)
+	var rangeRequests atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			rangeRequests.Add(1)
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer src.Close()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/unauthorized.bin"}, Options{
+		"out":                       "unauthorized.bin",
+		"split":                     "4",
+		"max-connection-per-server": "4",
+		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
+		"max-tries":                 "20",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusError)
+	status, err := engine.TellStatus(gid, []string{"errorMessage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status["errorMessage"].(string), "401") {
+		t.Fatalf("errorMessage = %#v, want 401", status["errorMessage"])
+	}
+	if got := rangeRequests.Load(); got > 4 {
+		t.Fatalf("range requests = %d, want no retries beyond initial concurrency", got)
 	}
 }
 
@@ -245,8 +407,9 @@ func runActiveSegmentedConnectionScaleTest(t *testing.T, adjust func(*Engine, st
 	defer engine.Close(context.Background())
 
 	gid, err := engine.AddURI([]string{src.URL + "/active-scale.bin"}, Options{
-		"out":            "active-scale.bin",
-		"min-split-size": "1",
+		"out":                      "active-scale.bin",
+		"min-split-size":           "1",
+		"goaria-http-segment-size": "16K",
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -384,6 +547,7 @@ func TestDefaultOptionsPreferAria2Compatibility(t *testing.T) {
 		"split":                     "5",
 		"max-connection-per-server": "1",
 		"min-split-size":            "20M",
+		"goaria-http-segment-size":  "50M",
 		"allow-overwrite":           "false",
 		"auto-file-renaming":        "true",
 		"continue":                  "false",

@@ -63,7 +63,10 @@ var smallCopyBufferPool = sync.Pool{
 	},
 }
 
-const metadataProbeRangeEnd = 1023
+const (
+	metadataProbeRangeEnd  = 1023
+	defaultHTTPSegmentSize = 50 * 1024 * 1024
+)
 
 type remoteMeta struct {
 	Length       int64
@@ -78,6 +81,19 @@ type remoteMeta struct {
 type chunkRange struct {
 	start int64
 	end   int64
+}
+
+type segmentedRangeTask struct {
+	r         chunkRange
+	attempts  int
+	notBefore time.Time
+}
+
+type segmentedRangeResult struct {
+	task      segmentedRangeTask
+	err       error
+	maxTries  int
+	retryWait time.Duration
 }
 
 type downloadSpeedTracker struct {
@@ -331,7 +347,7 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	d.setMetadata(meta, outPath)
 	if segmented {
 		opts = transportOptionsForSegmented(opts)
-		chunks := makeChunks(meta.Length, split, minSplit)
+		chunks := makeChunks(meta.Length, httpSegmentSize(opts, minSplit))
 		err = e.downloadSegmented(ctx, d, meta, outPath, opts, chunks, limiter)
 	} else {
 		err = e.downloadSingle(ctx, d, meta, outPath, opts, limiter)
@@ -372,6 +388,17 @@ func transportOptionsForSegmented(opts Options) Options {
 	out := cloneOptions(opts)
 	out["http-version"] = "1.1"
 	return out
+}
+
+func httpSegmentSize(opts Options, minSplit int64) int64 {
+	size := optionBytes(opts, "goaria-http-segment-size", defaultHTTPSegmentSize)
+	if size <= 0 {
+		size = defaultHTTPSegmentSize
+	}
+	if minSplit > size {
+		return minSplit
+	}
+	return size
 }
 
 func (e *Engine) probe(ctx context.Context, rawURI string, opts Options, conditionalPath string) (remoteMeta, error) {
@@ -473,89 +500,147 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 
 	segCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	tasks := make(chan chunkRange, len(chunks))
+	tasks := make([]segmentedRangeTask, 0, len(chunks))
 	for _, ch := range chunks {
-		tasks <- ch
+		tasks = append(tasks, segmentedRangeTask{r: ch})
 	}
-	close(tasks)
 
-	errCh := make(chan error, 1)
+	results := make(chan segmentedRangeResult, 1)
 	var wg sync.WaitGroup
-	var active atomic.Int64
-	started := 0
-	startWorker := func() {
+	active := 0
+	effectiveLimit := e.segmentedWorkerLimit(d, opts, len(chunks))
+	if effectiveLimit < 1 {
+		effectiveLimit = 1
+	}
+	adaptiveLimited := false
+	successSinceThrottle := 0
+	var firstErr error
+
+	startTask := func(task segmentedRangeTask) {
+		rangeOpts := transportOptionsForSegmented(d.optionSnapshot())
+		maxTries := optionInt(rangeOpts, "max-tries", 5)
+		if maxTries < 0 {
+			maxTries = 1
+		}
+		retryWait := time.Duration(optionInt(rangeOpts, "retry-wait", 0)) * time.Second
+		task.attempts++
+		active++
+		d.setConnections(active)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-segCtx.Done():
-					return
-				case r, ok := <-tasks:
-					if !ok {
-						return
-					}
-					if err := segCtx.Err(); err != nil {
-						return
-					}
-					rangeOpts := transportOptionsForSegmented(d.optionSnapshot())
-					maxTries := optionInt(rangeOpts, "max-tries", 5)
-					if maxTries < 0 {
-						maxTries = 1
-					}
-					retryWait := time.Duration(optionInt(rangeOpts, "retry-wait", 0)) * time.Second
-					d.setConnections(int(active.Add(1)))
-					err := e.downloadRangeWithRetries(segCtx, d, meta, path, rangeOpts, r, limiter, tracker, maxTries, retryWait)
-					d.setConnections(int(active.Add(-1)))
-					if err != nil {
-						select {
-						case errCh <- err:
-						default:
-						}
-						cancel()
-						return
-					}
-				}
-			}
+			err := e.downloadRange(segCtx, d, meta, path, rangeOpts, task.r, limiter, tracker)
+			results <- segmentedRangeResult{task: task, err: err, maxTries: maxTries, retryWait: retryWait}
 		}()
 	}
-	startWorkers := func() {
-		target := e.segmentedWorkerLimit(d, opts, len(chunks))
-		for started < target {
-			started++
-			startWorker()
+
+	startReady := func(now time.Time) {
+		if firstErr != nil {
+			return
+		}
+		ceiling := e.segmentedWorkerLimit(d, opts, len(chunks))
+		if ceiling < 1 {
+			ceiling = 1
+		}
+		if effectiveLimit > ceiling {
+			effectiveLimit = ceiling
+		}
+		if !adaptiveLimited && effectiveLimit < ceiling {
+			effectiveLimit = ceiling
+		}
+		for active < effectiveLimit {
+			idx := readySegmentedTaskIndex(tasks, now)
+			if idx < 0 {
+				return
+			}
+			task := tasks[idx]
+			tasks = append(tasks[:idx], tasks[idx+1:]...)
+			startTask(task)
 		}
 	}
 
-	startWorkers()
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	ctxDone := ctx.Done()
 	for {
+		startReady(time.Now())
+		if len(tasks) == 0 && active == 0 {
+			break
+		}
+		if firstErr != nil && active == 0 {
+			break
+		}
 		select {
-		case <-done:
-			d.setConnections(0)
-			select {
-			case err := <-errCh:
-				return err
-			default:
+		case result := <-results:
+			active--
+			d.setConnections(active)
+			if result.err == nil {
+				if adaptiveLimited {
+					successSinceThrottle++
+					ceiling := e.segmentedWorkerLimit(d, opts, len(chunks))
+					if effectiveLimit < ceiling && successSinceThrottle >= 2*effectiveLimit {
+						effectiveLimit++
+						successSinceThrottle = 0
+					}
+				}
+				continue
 			}
-			if err := ctx.Err(); err != nil {
-				return err
+			if isAdaptiveRangeThrottleError(result.err) {
+				adaptiveLimited = true
+				successSinceThrottle = 0
+				effectiveLimit = max(1, effectiveLimit/2)
+				if canRetryRangeAttempt(result.task.attempts, result.maxTries) {
+					result.task.notBefore = time.Now().Add(result.retryWait)
+					tasks = append(tasks, result.task)
+					continue
+				}
+			} else if isRetryableRangeSetupError(result.err) && canRetryRangeAttempt(result.task.attempts, result.maxTries) {
+				result.task.notBefore = time.Now().Add(result.retryWait)
+				tasks = append(tasks, result.task)
+				continue
 			}
-			return nil
+			if firstErr == nil {
+				firstErr = result.err
+				cancel()
+			}
 		case <-ticker.C:
-			startWorkers()
 		case <-ctxDone:
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
 			cancel()
 			ctxDone = nil
 		}
 	}
+	cancel()
+	wg.Wait()
+	d.setConnections(0)
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func readySegmentedTaskIndex(tasks []segmentedRangeTask, now time.Time) int {
+	for i, task := range tasks {
+		if task.notBefore.IsZero() || !task.notBefore.After(now) {
+			return i
+		}
+	}
+	return -1
+}
+
+func canRetryRangeAttempt(attempts, maxTries int) bool {
+	if maxTries == 0 {
+		return true
+	}
+	if maxTries < 0 {
+		maxTries = 1
+	}
+	return attempts < maxTries
 }
 
 func (e *Engine) segmentedWorkerLimit(d *Download, fallback Options, max int) int {
@@ -597,35 +682,23 @@ func (e *Engine) dynamicSegmentedOptionSnapshot(d *Download) Options {
 	return opts
 }
 
-func (e *Engine) downloadRangeWithRetries(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker, maxTries int, retryWait time.Duration) error {
-	var lastErr error
-	for attempt := 0; maxTries == 0 || attempt < maxTries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		err := e.downloadRange(ctx, d, meta, path, opts, r, limiter, tracker)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		if !isRetryableRangeSetupError(err) {
-			return err
-		}
-		if retryWait > 0 {
-			if err := sleepContext(ctx, retryWait); err != nil {
-				return err
-			}
-		}
-	}
-	return lastErr
-}
-
 func isRetryableRangeSetupError(err error) bool {
 	var bodyErr *rangeBodyError
 	if errors.As(err, &bodyErr) {
 		return false
 	}
 	return isRetryableDownloadError(err)
+}
+
+func isAdaptiveRangeThrottleError(err error) bool {
+	var status *httpStatusError
+	if !errors.As(err, &status) {
+		return false
+	}
+	if status.StatusCode == http.StatusForbidden || status.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	return status.StatusCode >= http.StatusInternalServerError && status.StatusCode <= 599
 }
 
 func (e *Engine) downloadRange(ctx context.Context, d *Download, meta remoteMeta, path string, opts Options, r chunkRange, limiter *rateLimiter, tracker *downloadSpeedTracker) error {

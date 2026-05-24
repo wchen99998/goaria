@@ -130,6 +130,7 @@
         "goaria-disable-trackers": { "$ref": "#/$defs/boolString" },
         "goaria-disable-utp": { "$ref": "#/$defs/boolString" },
         "goaria-exclude-file-ext": { "$ref": "#/$defs/extensionList" },
+        "goaria-http-segment-size": { "$ref": "#/$defs/sizeString" },
         "goaria-listen-host": { "type": "string", "maxLength": 256 },
         "goaria-peer-addrs": { "$ref": "#/$defs/stringList" },
         "goaria-max-torrent-size": { "$ref": "#/$defs/sizeString" },

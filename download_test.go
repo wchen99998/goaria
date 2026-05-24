@@ -177,6 +177,59 @@ func TestSegmentedHTTPDownloadAdaptsRangeThrottle(t *testing.T) {
 	}
 }
 
+func TestSegmentedHTTPDownloadStabilizesRangeThrottle(t *testing.T) {
+	data := bytes.Repeat([]byte("stable-adaptive-"), 128*1024)
+	var activeRanges atomic.Int32
+	var throttled atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		rng := r.Header.Get("Range")
+		if rng == "" {
+			http.Error(w, "expected range request", http.StatusBadRequest)
+			return
+		}
+		current := activeRanges.Add(1)
+		defer activeRanges.Add(-1)
+		if current > 2 {
+			throttled.Add(1)
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+		start, end, _ := parseTestRange(t, rng, int64(len(data)))
+		writeRange(w, data, start, end)
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/stable.bin"}, Options{
+		"out":                       "stable.bin",
+		"split":                     "5",
+		"max-connection-per-server": "5",
+		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
+		"max-tries":                 "30",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "stable.bin"), data)
+	if got := throttled.Load(); got == 0 {
+		t.Fatal("server did not throttle any range requests")
+	} else if got > 8 {
+		t.Fatalf("throttled range requests = %d, want stable probing with at most 8", got)
+	}
+}
+
 func TestSegmentedHTTPDownloadDoesNotAdaptUnauthorized(t *testing.T) {
 	data := bytes.Repeat([]byte("unauthorized-"), 32*1024)
 	var rangeRequests atomic.Int32

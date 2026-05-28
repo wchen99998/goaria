@@ -595,6 +595,7 @@ func TestJSONRPCHTTPRFCDownloadScenarios(t *testing.T) {
 			"split":                     "4",
 			"max-connection-per-server": "4",
 			"min-split-size":            "1",
+			"goaria-http-segment-size":  "16K",
 			"http-accept-gzip":          "true",
 			"header":                    []string{"Range: bytes=1-1", "Accept-Encoding: gzip"},
 		},

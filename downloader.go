@@ -98,32 +98,17 @@ type segmentedRangeResult struct {
 	retryWait time.Duration
 }
 
-// A generation represents one concurrency decision. When that decision is
-// rejected, later results from the same burst are stale and must not downshift
-// the limit again.
-const (
-	minAdaptiveProbeSuccesses = 16
-	adaptiveProbeSuccessScale = 8
-	maxAdaptiveProbePenalty   = 16
-)
-
 type segmentedConcurrencyController struct {
-	effectiveLimit       int
-	adaptiveLimited      bool
-	safeLimit            int
-	successSinceThrottle int
-	probePenalty         int
-	generation           int
+	effectiveLimit     int
+	successesAtLimit   int
+	rejectedProbeLimit int
+	generation         int
 }
 
 func newSegmentedConcurrencyController(ceiling int) *segmentedConcurrencyController {
-	if ceiling < 1 {
-		ceiling = 1
-	}
-	return &segmentedConcurrencyController{
-		effectiveLimit: ceiling,
-		probePenalty:   1,
-	}
+	c := &segmentedConcurrencyController{effectiveLimit: 1}
+	c.clampCeiling(ceiling)
+	return c
 }
 
 func (c *segmentedConcurrencyController) limit() int {
@@ -138,47 +123,33 @@ func (c *segmentedConcurrencyController) launchState() (int, int) {
 }
 
 func (c *segmentedConcurrencyController) clampCeiling(ceiling int) {
-	if ceiling < 1 {
-		ceiling = 1
-	}
+	ceiling = c.adjustedCeiling(ceiling)
 	oldLimit := c.effectiveLimit
-	if !c.adaptiveLimited {
+	if c.effectiveLimit < 1 {
+		c.effectiveLimit = 1
+	}
+	if c.effectiveLimit > ceiling {
 		c.effectiveLimit = ceiling
-	} else {
-		if c.effectiveLimit > ceiling {
-			c.effectiveLimit = ceiling
-		}
-		if c.safeLimit > ceiling {
-			c.safeLimit = ceiling
-		}
-		if c.effectiveLimit < 1 {
-			c.effectiveLimit = 1
-		}
-		if c.safeLimit < 1 {
-			c.safeLimit = c.effectiveLimit
-		}
 	}
 	if c.effectiveLimit != oldLimit {
-		c.successSinceThrottle = 0
+		c.successesAtLimit = 0
 		c.generation++
 	}
 }
 
 func (c *segmentedConcurrencyController) onSuccess(launchLimit, launchGeneration, ceiling int) {
 	c.clampCeiling(ceiling)
-	if !c.adaptiveLimited || launchGeneration != c.generation {
+	if launchGeneration != c.generation || launchLimit != c.effectiveLimit {
 		return
 	}
-	if launchLimit > c.safeLimit && launchLimit <= ceiling {
-		c.safeLimit = launchLimit
-		c.probePenalty = 1
-		c.successSinceThrottle = 0
+	c.successesAtLimit++
+	if c.successesAtLimit < c.effectiveLimit {
 		return
 	}
-	c.successSinceThrottle++
-	if c.effectiveLimit < ceiling && c.successSinceThrottle >= c.successThreshold() {
+	c.successesAtLimit = 0
+	ceiling = c.adjustedCeiling(ceiling)
+	if c.effectiveLimit < ceiling {
 		c.effectiveLimit++
-		c.successSinceThrottle = 0
 		c.generation++
 	}
 }
@@ -191,52 +162,42 @@ func (c *segmentedConcurrencyController) onThrottle(launchLimit, launchGeneratio
 	if launchLimit < 1 {
 		launchLimit = c.limit()
 	}
-	previousSafeLimit := c.safeLimit
-	nextLimit := launchLimit / 2
-	if previousSafeLimit > 0 && launchLimit <= previousSafeLimit+1 {
-		nextLimit = launchLimit - 1
-		if nextLimit > previousSafeLimit {
-			nextLimit = previousSafeLimit
-		}
+	if launchLimit > 1 && (c.rejectedProbeLimit == 0 || launchLimit < c.rejectedProbeLimit) {
+		c.rejectedProbeLimit = launchLimit
 	}
+	nextLimit := launchLimit - 1
 	if nextLimit < 1 {
 		nextLimit = 1
 	}
-	if ceiling > 0 && nextLimit > ceiling {
+	ceiling = c.adjustedCeiling(ceiling)
+	if nextLimit > ceiling {
 		nextLimit = ceiling
 	}
-
-	c.adaptiveLimited = true
 	c.effectiveLimit = nextLimit
-	if c.safeLimit == 0 || c.safeLimit > nextLimit {
-		c.safeLimit = nextLimit
-	}
-	c.successSinceThrottle = 0
-	if c.probePenalty < 1 {
-		c.probePenalty = 1
-	}
-	if previousSafeLimit > 0 {
-		c.probePenalty *= 2
-		if c.probePenalty > maxAdaptiveProbePenalty {
-			c.probePenalty = maxAdaptiveProbePenalty
-		}
-	}
+	c.successesAtLimit = 0
 	c.generation++
 }
 
-func (c *segmentedConcurrencyController) successThreshold() int {
-	threshold := c.effectiveLimit * adaptiveProbeSuccessScale
-	if threshold < minAdaptiveProbeSuccesses {
-		threshold = minAdaptiveProbeSuccesses
+func (c *segmentedConcurrencyController) onRetryableError(launchLimit, launchGeneration, ceiling int) {
+	c.clampCeiling(ceiling)
+	if launchGeneration != c.generation || launchLimit != c.effectiveLimit {
+		return
 	}
-	penalty := c.probePenalty
-	if penalty < 1 {
-		penalty = 1
+	c.successesAtLimit = 0
+	c.generation++
+}
+
+func (c *segmentedConcurrencyController) adjustedCeiling(ceiling int) int {
+	if ceiling < 1 {
+		ceiling = 1
 	}
-	if penalty > maxAdaptiveProbePenalty {
-		penalty = maxAdaptiveProbePenalty
+	if c.rejectedProbeLimit > 0 && ceiling >= c.rejectedProbeLimit {
+		ceiling = c.rejectedProbeLimit - 1
+		if ceiling < 1 {
+			ceiling = 1
+		}
 	}
-	return threshold * penalty
+	return ceiling
 }
 
 type downloadSpeedTracker struct {
@@ -653,6 +614,13 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 	active := 0
 	controller := newSegmentedConcurrencyController(e.segmentedWorkerLimit(d, opts, len(chunks)))
 	var firstErr error
+	remainingChunks := func(includeResult bool) int {
+		remaining := active + len(tasks)
+		if includeResult {
+			remaining++
+		}
+		return remaining
+	}
 
 	startTask := func(task segmentedRangeTask) {
 		rangeOpts := transportOptionsForSegmented(d.optionSnapshot())
@@ -677,7 +645,7 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 		if firstErr != nil {
 			return
 		}
-		ceiling := e.segmentedWorkerLimit(d, opts, len(chunks))
+		ceiling := e.segmentedWorkerLimit(d, opts, remainingChunks(false))
 		controller.clampCeiling(ceiling)
 		for active < controller.limit() {
 			idx := readySegmentedTaskIndex(tasks, now)
@@ -706,20 +674,25 @@ func (e *Engine) downloadSegmented(ctx context.Context, d *Download, meta remote
 			active--
 			d.setConnections(active)
 			if result.err == nil {
-				controller.onSuccess(result.task.launchLimit, result.task.launchGeneration, e.segmentedWorkerLimit(d, opts, len(chunks)))
+				controller.onSuccess(result.task.launchLimit, result.task.launchGeneration, e.segmentedWorkerLimit(d, opts, remainingChunks(false)))
 				continue
 			}
 			if isAdaptiveRangeThrottleError(result.err) {
-				controller.onThrottle(result.task.launchLimit, result.task.launchGeneration, e.segmentedWorkerLimit(d, opts, len(chunks)))
-				if canRetryRangeAttempt(result.task.attempts, result.maxTries) {
+				canRetry := canRetryRangeAttempt(result.task.attempts, result.maxTries)
+				controller.onThrottle(result.task.launchLimit, result.task.launchGeneration, e.segmentedWorkerLimit(d, opts, remainingChunks(canRetry)))
+				if canRetry {
 					result.task.notBefore = time.Now().Add(result.retryWait)
 					tasks = append(tasks, result.task)
 					continue
 				}
-			} else if isRetryableRangeSetupError(result.err) && canRetryRangeAttempt(result.task.attempts, result.maxTries) {
-				result.task.notBefore = time.Now().Add(result.retryWait)
-				tasks = append(tasks, result.task)
-				continue
+			} else if isRetryableRangeSetupError(result.err) {
+				canRetry := canRetryRangeAttempt(result.task.attempts, result.maxTries)
+				if canRetry {
+					controller.onRetryableError(result.task.launchLimit, result.task.launchGeneration, e.segmentedWorkerLimit(d, opts, remainingChunks(true)))
+					result.task.notBefore = time.Now().Add(result.retryWait)
+					tasks = append(tasks, result.task)
+					continue
+				}
 			}
 			if firstErr == nil {
 				firstErr = result.err
@@ -767,7 +740,7 @@ func canRetryRangeAttempt(attempts, maxTries int) bool {
 
 func (e *Engine) segmentedWorkerLimit(d *Download, fallback Options, max int) int {
 	if max < 1 {
-		return 0
+		max = 1
 	}
 	opts := e.dynamicSegmentedOptionSnapshot(d)
 	if opts == nil {

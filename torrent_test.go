@@ -1722,3 +1722,55 @@ func startLocalTorrentSeeder(t *testing.T) (seedDir string, encoded string, peer
 	}
 	return seedDir, base64.StdEncoding.EncodeToString(buf.Bytes()), peerAddrs, stop, want
 }
+
+func TestTorrentRuntimeReleasedAfterCompletion(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, info, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadDir := t.TempDir()
+	writeTestTorrentPayload(t, payloadDir, info)
+	peerAddrs, stopSeeder := startSeederForMetaInfo(t, payloadDir, mi)
+	defer stopSeeder()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+		"goaria-peer-addrs":       peerAddrs,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+
+	engine.mu.RLock()
+	d := engine.downloads[gid]
+	engine.mu.RUnlock()
+	d.mu.RLock()
+	runtimeReleased := d.torrent == nil
+	d.mu.RUnlock()
+	if !runtimeReleased {
+		t.Fatal("torrent runtime retained after completion")
+	}
+
+	d.mu.Lock()
+	metaInfo, err := d.metadataInfoLocked()
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metaInfo == nil {
+		t.Fatal("metadata unavailable after runtime release")
+	}
+}

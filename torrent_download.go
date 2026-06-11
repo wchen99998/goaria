@@ -749,6 +749,9 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	if optionBool(opts, "goaria-torrent-no-upload") {
 		cfg.NoUpload = true
 	}
+	if optionBool(opts, "goaria-torrent-disable-smart-ban") {
+		cfg.DisableSmartBanning = true
+	}
 	cfg.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	applyTorrentPeerDiscoveryOptions(cfg, opts, privateTorrent)
 	cfg.DisableUTP = optionBool(opts, "disable-utp") || optionBool(opts, "goaria-disable-utp")
@@ -977,6 +980,14 @@ func (e *Engine) refreshTorrentMetadata(d *Download, tor *torrent.Torrent, opts 
 	d.torrentFiles = files
 	d.totalLength = torrentSelectedLength(d.torrentFiles)
 	d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
+	if len(d.torrentData) == 0 {
+		// Keep the metainfo for magnet downloads so metadata queries keep working
+		// after the torrent runtime is released.
+		var buf bytes.Buffer
+		if err := bencode.NewEncoder(&buf).Encode(mi); err == nil {
+			d.torrentData = buf.Bytes()
+		}
+	}
 	d.mu.Unlock()
 	return nil
 }

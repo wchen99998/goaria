@@ -69,6 +69,10 @@ func (e *Engine) finishDownload(d *Download, err error) {
 	e.mu.Lock()
 	delete(e.active, d.gid)
 	d.mu.Lock()
+	// The torrent client is closed once runTorrentDownload returns. Drop the
+	// runtime so the client's per-piece and per-peer state can be collected;
+	// metadata queries fall back to d.torrentData.
+	d.torrent = nil
 	if d.status == StatusActive {
 		d.cancel = nil
 		d.connections = 0

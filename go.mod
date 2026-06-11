@@ -95,7 +95,7 @@ require (
 	github.com/go-faker/faker/v4 v4.6.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/thoas/go-funk v0.9.3 // indirect
-	github.com/wchen99998/torrent v1.54.5
+	github.com/wchen99998/torrent v1.54.6
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.44.0 // indirect
 	golang.org/x/exp v0.0.0-20251125195548-87e1e737ad39 // indirect

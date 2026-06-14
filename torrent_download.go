@@ -24,6 +24,7 @@ import (
 	"github.com/wchen99998/torrent/metainfo"
 	"github.com/wchen99998/torrent/storage"
 	"github.com/wchen99998/torrent/stream"
+	"go.uber.org/zap"
 	"golang.org/x/time/rate"
 )
 
@@ -793,6 +794,7 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	if err != nil {
 		return err
 	}
+	e.installTorrentWriteChunkErrorHandler(d, tor)
 	if urls := torrentWebSeedURLs(webseeds); len(urls) > 0 {
 		tor.AddWebSeeds(urls, e.torrentWebSeedOptions(opts)...)
 	}
@@ -853,6 +855,28 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	}
 	e.notify("aria2.onBtDownloadComplete", d.gid)
 	return nil
+}
+
+func (e *Engine) installTorrentWriteChunkErrorHandler(d *Download, tor *torrent.Torrent) {
+	tor.SetOnWriteChunkError(func(err error) {
+		if errors.Is(err, storage.ErrFileReleased) {
+			e.log.Warn("recovering torrent write to released storage",
+				zap.String("gid", d.gid),
+				zap.Error(err),
+			)
+			tor.AllowDataDownload()
+			return
+		}
+		e.log.Error("torrent write chunk error; disabling data download",
+			zap.String("gid", d.gid),
+			zap.Error(err),
+		)
+		d.mu.Lock()
+		d.errorCode = "1"
+		d.errorMessage = fmt.Sprintf("torrent write chunk error: %v", err)
+		d.mu.Unlock()
+		tor.DisallowDataDownload()
+	})
 }
 
 func applyTorrentTrackerOptions(spec *torrent.TorrentSpec, opts Options) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -24,7 +25,11 @@ func (e *Engine) scheduler() {
 }
 
 func (e *Engine) schedule() {
-	var starts []*Download
+	type startDownload struct {
+		download *Download
+		ctx      context.Context
+	}
+	var starts []startDownload
 	e.mu.Lock()
 	maxActive := optionInt(e.global, "max-concurrent-downloads", e.cfg.MaxConcurrentDownloads)
 	for e.ctx.Err() == nil && len(e.active) < maxActive && len(e.waiting) > 0 {
@@ -49,26 +54,34 @@ func (e *Engine) schedule() {
 		d.connections = 0
 		d.mu.Unlock()
 		e.active[gid] = struct{}{}
-		starts = append(starts, d)
+		starts = append(starts, startDownload{download: d, ctx: ctx})
 	}
 	e.mu.Unlock()
 
-	for _, d := range starts {
-		e.notify("aria2.onDownloadStart", d.gid)
+	for _, start := range starts {
+		e.notify("aria2.onDownloadStart", start.download.gid)
 		e.wg.Add(1)
-		go func(download *Download) {
+		go func(download *Download, runCtx context.Context) {
 			defer e.wg.Done()
 			err := e.runDownload(download)
-			e.finishDownload(download, err)
-		}(d)
+			e.finishDownload(download, runCtx, err)
+		}(start.download, start.ctx)
 	}
 }
 
-func (e *Engine) finishDownload(d *Download, err error) {
+func (e *Engine) finishDownload(d *Download, runCtx context.Context, err error) {
 	var notification string
 	e.mu.Lock()
-	delete(e.active, d.gid)
 	d.mu.Lock()
+	if d.ctx != runCtx {
+		if d.status != StatusActive {
+			d.torrent = nil
+		}
+		d.mu.Unlock()
+		e.mu.Unlock()
+		return
+	}
+	delete(e.active, d.gid)
 	// The torrent client is closed once runTorrentDownload returns. Drop the
 	// runtime so the client's per-piece and per-peer state can be collected;
 	// metadata queries fall back to d.torrentData.
@@ -86,7 +99,7 @@ func (e *Engine) finishDownload(d *Download, err error) {
 				d.totalLength = d.completedLen
 			}
 			notification = "aria2.onDownloadComplete"
-		} else if e.ctx.Err() != nil {
+		} else if e.ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			d.status = StatusPaused
 		} else {
 			d.status = StatusError

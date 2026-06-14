@@ -859,6 +859,13 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 
 func (e *Engine) installTorrentWriteChunkErrorHandler(d *Download, tor *torrent.Torrent) {
 	tor.SetOnWriteChunkError(func(err error) {
+		if errors.Is(err, context.Canceled) {
+			e.log.Debug("ignoring canceled torrent write",
+				zap.String("gid", d.gid),
+				zap.Error(err),
+			)
+			return
+		}
 		if errors.Is(err, storage.ErrFileReleased) {
 			e.log.Warn("recovering torrent write to released storage",
 				zap.String("gid", d.gid),

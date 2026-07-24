@@ -221,11 +221,13 @@ func TestJSONRPCOptionCoverage(t *testing.T) {
 
 	for i, key := range manifestKeys {
 		value := materializeOptionValue(t, manifest.OptionCases[key], temp)
-		t.Run("global/"+key, func(t *testing.T) {
-			expectOK(t, client.Call(t, "aria2.changeGlobalOption", map[string]any{key: value}))
-			got := objectResult(t, client.Call(t, "aria2.getGlobalOption"))
-			assertOptionValue(t, got, key, value)
-		})
+		if key != "gid" { // gid is per-download and cannot be a global default.
+			t.Run("global/"+key, func(t *testing.T) {
+				expectOK(t, client.Call(t, "aria2.changeGlobalOption", map[string]any{key: value}))
+				got := objectResult(t, client.Call(t, "aria2.getGlobalOption"))
+				assertOptionValue(t, got, key, value)
+			})
+		}
 		t.Run("download/"+key, func(t *testing.T) {
 			gid := fmt.Sprintf("200000000000%04x", i+1)
 			opts := map[string]any{"pause": "true", "gid": gid}

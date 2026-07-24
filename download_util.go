@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -167,6 +169,9 @@ func validateOpenRangeResponse(resp *http.Response, expectedStart, expectedTotal
 	if expectedTotal >= 0 && cr.totalKnown && cr.total != expectedTotal {
 		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range total %d does not match expected total %d", cr.total, expectedTotal)
 	}
+	if expectedTotal >= 0 && cr.end != expectedTotal-1 {
+		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range %q does not complete expected total %d", resp.Header.Get("Content-Range"), expectedTotal)
+	}
 	if cr.totalKnown && cr.end != cr.total-1 {
 		return byteContentRange{}, newHTTPProtocolError("partial response Content-Range %q does not complete the open-ended range", resp.Header.Get("Content-Range"))
 	}
@@ -286,31 +291,170 @@ func isSimpleRelativeName(name string) bool {
 
 func (e *Engine) ensureDownloadDir(dir string) error {
 	dir = filepath.Clean(dir)
-	e.dirMu.Lock()
-	if _, ok := e.createdDir[dir]; ok {
-		e.dirMu.Unlock()
-		info, err := os.Stat(dir)
-		if err == nil && info.IsDir() {
-			return nil
+	return os.MkdirAll(dir, 0o755)
+}
+
+// reserveOutputPath prevents two downloads in the same Engine from writing the
+// same destination concurrently. The filesystem existence checks still decide
+// overwrite/resume behavior; reservations cover the otherwise unavoidable
+// window between choosing a path and creating it.
+func (e *Engine) reserveOutputPath(path, gid string, autoRename bool) (string, error) {
+	key, err := outputPathReservationKey(path)
+	if err != nil {
+		return "", err
+	}
+
+	e.pathMu.Lock()
+	defer e.pathMu.Unlock()
+	if owner, ok := e.pathReservations[key]; !ok || owner == gid {
+		e.recordPathReservationLocked(key, gid)
+		return path, nil
+	}
+	if !autoRename {
+		return "", fmt.Errorf("output path is already in use: %s", path)
+	}
+	for i := 1; i < 10000; i++ {
+		candidate := fmt.Sprintf("%s.%d", path, i)
+		candidateKey, err := outputPathReservationKey(candidate)
+		if err != nil {
+			return "", err
 		}
+		if _, reserved := e.pathReservations[candidateKey]; reserved {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		e.recordPathReservationLocked(candidateKey, gid)
+		return candidate, nil
+	}
+	return "", fmt.Errorf("could not find available auto-renamed path for %s", path)
+}
+
+func outputPathReservationKey(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absolute = filepath.Clean(absolute)
+	current := absolute
+	var suffix []string
+	symlinkHops := 0
+	for {
+		if info, lstatErr := os.Lstat(current); lstatErr == nil && info.Mode()&os.ModeSymlink != 0 {
+			if symlinkHops >= 255 {
+				return "", fmt.Errorf("too many symlinks while resolving %s", path)
+			}
+			target, err := os.Readlink(current)
+			if err != nil {
+				return "", err
+			}
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(current), target)
+			}
+			current = filepath.Clean(target)
+			symlinkHops++
+			continue
+		} else if lstatErr != nil && !errors.Is(lstatErr, os.ErrNotExist) {
+			return "", lstatErr
+		}
+		resolved, err := filepath.EvalSymlinks(current)
 		if err == nil {
-			return fmt.Errorf("%s exists and is not a directory", dir)
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return absolute, nil
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
+}
+
+// reserveOutputPaths reserves a set as one operation. It is intentionally
+// separate from reserveOutputPath: torrent storage paths are fixed before the
+// client starts and therefore cannot be auto-renamed after a conflict.
+func (e *Engine) reserveOutputPaths(paths []string, gid string) error {
+	return e.updateOutputPathReservations(paths, gid, false)
+}
+
+func (e *Engine) replaceOutputPaths(paths []string, gid string) error {
+	return e.updateOutputPathReservations(paths, gid, true)
+}
+
+func (e *Engine) updateOutputPathReservations(paths []string, gid string, replace bool) error {
+	type reservation struct {
+		key  string
+		path string
+	}
+	reservations := make([]reservation, 0, len(paths))
+	seen := make(map[string]string, len(paths))
+	for _, path := range paths {
+		key, err := outputPathReservationKey(path)
+		if err != nil {
 			return err
 		}
-	} else {
-		e.dirMu.Unlock()
+		if previous, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("multiple files use the same output path: %s and %s", previous, path)
+		}
+		seen[key] = path
+		reservations = append(reservations, reservation{key: key, path: path})
 	}
 
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	e.pathMu.Lock()
+	defer e.pathMu.Unlock()
+	for _, candidate := range reservations {
+		if owner, reserved := e.pathReservations[candidate.key]; reserved && owner != gid {
+			return fmt.Errorf("output path is already in use: %s", candidate.path)
+		}
 	}
-
-	e.dirMu.Lock()
-	e.createdDir[dir] = struct{}{}
-	e.dirMu.Unlock()
+	if replace {
+		for existing := range e.reservedPathsByGID[gid] {
+			if _, keep := seen[existing]; !keep {
+				delete(e.pathReservations, existing)
+				delete(e.reservedPathsByGID[gid], existing)
+			}
+		}
+	}
+	for _, candidate := range reservations {
+		e.recordPathReservationLocked(candidate.key, gid)
+	}
 	return nil
+}
+
+func (e *Engine) recordPathReservationLocked(path, gid string) {
+	if e.pathReservations == nil {
+		e.pathReservations = make(map[string]string)
+	}
+	if e.reservedPathsByGID == nil {
+		e.reservedPathsByGID = make(map[string]map[string]struct{})
+	}
+	e.pathReservations[path] = gid
+	paths := e.reservedPathsByGID[gid]
+	if paths == nil {
+		paths = make(map[string]struct{})
+		e.reservedPathsByGID[gid] = paths
+	}
+	paths[path] = struct{}{}
+}
+
+func (e *Engine) releaseOutputPaths(gid string) {
+	e.pathMu.Lock()
+	defer e.pathMu.Unlock()
+	for path := range e.reservedPathsByGID[gid] {
+		if e.pathReservations[path] == gid {
+			delete(e.pathReservations, path)
+		}
+	}
+	delete(e.reservedPathsByGID, gid)
 }
 
 func makeChunks(total, chunkSize int64) []chunkRange {
@@ -320,13 +464,18 @@ func makeChunks(total, chunkSize int64) []chunkRange {
 	if chunkSize <= 0 {
 		chunkSize = defaultHTTPSegmentSize
 	}
+	if minChunkSize := ceilDivInt64(total, maxHTTPSegmentCount); chunkSize < minChunkSize {
+		chunkSize = minChunkSize
+	}
 	chunks := make([]chunkRange, 0, int(ceilDivInt64(total, chunkSize)))
-	for start := int64(0); start < total; start += chunkSize {
-		end := start + chunkSize - 1
-		if end >= total {
-			end = total - 1
+	for start := int64(0); start < total; {
+		size := chunkSize
+		if remaining := total - start; size > remaining {
+			size = remaining
 		}
+		end := start + size - 1
 		chunks = append(chunks, chunkRange{start: start, end: end})
+		start = end + 1
 	}
 	return chunks
 }
@@ -335,10 +484,11 @@ func bitfieldFor(total, completed, pieceLength int64) string {
 	if total <= 0 || pieceLength <= 0 {
 		return ""
 	}
-	pieces := int(ceilDivInt64(total, pieceLength))
-	if pieces <= 0 {
+	pieceCount := ceilDivInt64(total, pieceLength)
+	if pieceCount <= 0 || pieceCount > maxTorrentPieceCount || pieceCount > int64(int(^uint(0)>>1)) {
 		return ""
 	}
+	pieces := int(pieceCount)
 	bytesLen := (pieces + 7) / 8
 	bits := make([]byte, bytesLen)
 	completePieces := int(completedPieces(total, completed, pieceLength))
@@ -400,7 +550,15 @@ func isRetryableDownloadError(err error) bool {
 	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrShortWrite) {
 		return true
 	}
-	return true
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 
 func isFileNotFoundError(err error) bool {

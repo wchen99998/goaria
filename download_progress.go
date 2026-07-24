@@ -80,12 +80,65 @@ func (d *Download) addCompleted(n int64) {
 	if d.totalLength > 0 && d.completedLen > d.totalLength {
 		d.completedLen = d.totalLength
 	}
-	if d.pieceLength > 0 {
+	// Segmented downloads mark bits only after their corresponding range has
+	// completed. Aggregate byte counts cannot identify which out-of-order
+	// range those bytes belong to.
+	if d.pieceLength > 0 && d.numPieces <= 1 {
 		done := completedPieces(d.totalLength, d.completedLen, d.pieceLength)
 		if done != d.donePieces {
 			d.donePieces = done
 			d.bitfield = bitfieldFor(d.totalLength, d.completedLen, d.pieceLength)
 		}
+	}
+}
+
+func (d *Download) rollbackCompleted(n int64) {
+	if n <= 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.completedLen -= n
+	if d.completedLen < 0 {
+		d.completedLen = 0
+	}
+}
+
+func (d *Download) markPieceComplete(index int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if index < 0 || int64(index) >= d.numPieces || d.bitfield == "" {
+		return
+	}
+	hexIndex := index / 4
+	if hexIndex >= len(d.bitfield) {
+		return
+	}
+	nibble, ok := decodeHexNibble(d.bitfield[hexIndex])
+	if !ok {
+		return
+	}
+	mask := byte(1 << uint(3-index%4))
+	if nibble&mask != 0 {
+		return
+	}
+	nibble |= mask
+	bits := []byte(d.bitfield)
+	bits[hexIndex] = "0123456789abcdef"[nibble]
+	d.bitfield = string(bits)
+	d.donePieces++
+}
+
+func decodeHexNibble(b byte) (byte, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return b - '0', true
+	case b >= 'a' && b <= 'f':
+		return b - 'a' + 10, true
+	case b >= 'A' && b <= 'F':
+		return b - 'A' + 10, true
+	default:
+		return 0, false
 	}
 }
 

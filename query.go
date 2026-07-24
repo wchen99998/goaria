@@ -1,6 +1,9 @@
 package goaria
 
 import (
+	"math"
+	"net/url"
+	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -128,7 +131,11 @@ func (e *Engine) GetGlobalStat() GlobalStat {
 		switch d.status {
 		case StatusActive:
 			active++
-			speed += d.downloadBPS
+			if d.downloadBPS > math.MaxInt64-speed {
+				speed = math.MaxInt64
+			} else if d.downloadBPS > 0 {
+				speed += d.downloadBPS
+			}
 		case StatusWaiting, StatusPaused:
 			waiting++
 		}
@@ -158,11 +165,14 @@ func (e *Engine) downloadsByStatus(status Status) []*Download {
 	}
 	sort.Slice(items, func(i, j int) bool {
 		items[i].mu.RLock()
-		ci := items[i].createdAt
+		ci, gi := items[i].createdAt, items[i].gid
 		items[i].mu.RUnlock()
 		items[j].mu.RLock()
-		cj := items[j].createdAt
+		cj, gj := items[j].createdAt, items[j].gid
 		items[j].mu.RUnlock()
+		if ci.Equal(cj) {
+			return gi < gj
+		}
 		return ci.Before(cj)
 	})
 	return items
@@ -193,11 +203,14 @@ func (e *Engine) waitingDownloads() []*Download {
 	}
 	sort.Slice(paused, func(i, j int) bool {
 		paused[i].mu.RLock()
-		ci := paused[i].createdAt
+		ci, gi := paused[i].createdAt, paused[i].gid
 		paused[i].mu.RUnlock()
 		paused[j].mu.RLock()
-		cj := paused[j].createdAt
+		cj, gj := paused[j].createdAt, paused[j].gid
 		paused[j].mu.RUnlock()
+		if ci.Equal(cj) {
+			return gi < gj
+		}
 		return ci.Before(cj)
 	})
 	items = append(items, paused...)
@@ -309,7 +322,7 @@ func (d *Download) filesLocked() []FileInfo {
 				Length:          strconv.FormatInt(f.Length, 10),
 				CompletedLength: strconv.FormatInt(f.Completed, 10),
 				Selected:        strconv.FormatBool(f.Selected),
-				URIs:            cloneURIs(f.URIs),
+				URIs:            cloneURIs(d.uris),
 			})
 		}
 		return out
@@ -346,17 +359,17 @@ func sliceDownloads(items []*Download, offset, num int) []*Download {
 		if offset >= len(items) {
 			return []*Download{}
 		}
-		end := offset + num
-		if end > len(items) {
-			end = len(items)
+		remaining := len(items) - offset
+		if num > remaining {
+			num = remaining
 		}
-		return items[offset:end]
+		return items[offset : offset+num]
 	}
 	start := len(items) + offset
 	if start < 0 {
 		start = 0
 	}
-	out := make([]*Download, 0, num)
+	out := make([]*Download, 0, minInt(num, start+1))
 	for i := start; i >= 0 && len(out) < num; i-- {
 		out = append(out, items[i])
 	}
@@ -377,11 +390,33 @@ func currentOrOriginal(current, original string) string {
 }
 
 func filenameFromURI(raw string) string {
-	if i := strings.IndexByte(raw, '?'); i >= 0 {
+	if u, err := url.Parse(raw); err == nil {
+		// Work with the final escaped URL path segment so queries, fragments,
+		// and the authority can never become part of the local filename.
+		escapedPath := u.EscapedPath()
+		if escapedPath == "" || strings.HasSuffix(escapedPath, "/") {
+			return "index.html"
+		}
+		if segment := path.Base(escapedPath); segment != "." && segment != "/" && segment != "" {
+			if decoded, err := url.PathUnescape(segment); err == nil {
+				return safeURIFilename(decoded)
+			}
+			return safeURIFilename(segment)
+		}
+		return "index.html"
+	}
+
+	// Preserve a useful basename for malformed input while still excluding
+	// query and fragment syntax. Valid download URIs are rejected earlier.
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
 		raw = raw[:i]
 	}
+	return safeURIFilename(raw)
+}
+
+func safeURIFilename(raw string) string {
 	name := filepath.Base(raw)
-	if name == "." || name == "/" || name == "" {
+	if name == "." || name == ".." || name == "/" || name == `\` || name == "" || strings.IndexByte(name, 0) >= 0 {
 		return "index.html"
 	}
 	return name

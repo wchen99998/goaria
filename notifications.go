@@ -2,13 +2,21 @@ package goaria
 
 import "time"
 
+const maxNotificationBuffer = 4096
+
 func (e *Engine) Subscribe(buffer int) (<-chan Notification, func()) {
 	if buffer <= 0 {
 		buffer = 32
+	} else if buffer > maxNotificationBuffer {
+		buffer = maxNotificationBuffer
 	}
 	ch := make(chan Notification, buffer)
 	e.subMu.Lock()
-	e.subscribers[ch] = struct{}{}
+	if e.ctx.Err() != nil {
+		close(ch)
+	} else {
+		e.subscribers[ch] = struct{}{}
+	}
 	e.subMu.Unlock()
 	cancel := func() {
 		e.subMu.Lock()
@@ -19,6 +27,15 @@ func (e *Engine) Subscribe(buffer int) (<-chan Notification, func()) {
 		e.subMu.Unlock()
 	}
 	return ch, cancel
+}
+
+func (e *Engine) closeSubscribers() {
+	e.subMu.Lock()
+	for ch := range e.subscribers {
+		delete(e.subscribers, ch)
+		close(ch)
+	}
+	e.subMu.Unlock()
 }
 
 func (e *Engine) notify(method, gid string) {

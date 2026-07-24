@@ -22,6 +22,13 @@ func applyRequestOptions(req *http.Request, opts Options) {
 			continue
 		}
 		value = strings.TrimSpace(value)
+		if strings.EqualFold(name, "Host") {
+			// net/http deliberately ignores a Host entry in Request.Header. The
+			// wire-level host override lives in Request.Host instead.
+			req.Header.Del("Host")
+			req.Host = value
+			continue
+		}
 		if strings.EqualFold(name, "User-Agent") {
 			headerUserAgent = true
 			req.Header.Set(name, value)
@@ -35,7 +42,9 @@ func applyRequestOptions(req *http.Request, opts Options) {
 	}
 	if ref := optionString(opts, "referer"); ref != "" {
 		if ref == "*" {
-			ref = req.URL.String()
+			u := *req.URL
+			u.User = nil
+			ref = u.String()
 		}
 		req.Header.Set("Referer", ref)
 	}
@@ -74,6 +83,10 @@ func applyRangeRequestOptions(req *http.Request, opts Options, rangeValue string
 func applyIfRange(req *http.Request, meta remoteMeta) {
 	if etag := strongETag(meta.ETag); etag != "" {
 		req.Header.Set("If-Range", etag)
+		return
+	}
+	if modified, err := http.ParseTime(meta.LastModified); err == nil {
+		req.Header.Set("If-Range", modified.UTC().Format(http.TimeFormat))
 	}
 }
 
@@ -178,13 +191,13 @@ func filenameFromResponse(resp *http.Response, original string) string {
 	if cd := resp.Header.Get("Content-Disposition"); cd != "" {
 		if _, params, err := mime.ParseMediaType(cd); err == nil {
 			if name := params["filename"]; name != "" {
-				return filepath.Base(name)
+				return safeURIFilename(name)
 			}
 		}
 	}
 	if resp.Request != nil && resp.Request.URL != nil {
 		if name := filepath.Base(resp.Request.URL.Path); name != "." && name != "/" && name != "" {
-			return name
+			return safeURIFilename(name)
 		}
 	}
 	return filenameFromURI(original)

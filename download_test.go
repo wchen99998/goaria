@@ -3,7 +3,9 @@ package goaria
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -59,6 +61,128 @@ func TestSegmentedHTTPDownloadCompletes(t *testing.T) {
 	}
 	if status["totalLength"] != status["completedLength"] {
 		t.Fatalf("length mismatch: %#v", status)
+	}
+}
+
+func TestSegmentedHTTPBitfieldTracksOutOfOrderChunks(t *testing.T) {
+	const chunkSize = 1024
+	data := bytes.Repeat([]byte("b"), 3*chunkSize)
+	releaseMiddle := make(chan struct{})
+	thirdServed := make(chan struct{})
+	var releaseOnce sync.Once
+	var thirdOnce sync.Once
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		start, end, _ := parseTestRange(t, r.Header.Get("Range"), int64(len(data)))
+		if start == chunkSize {
+			<-releaseMiddle
+		}
+		writeRange(w, data, start, end)
+		if start == 2*chunkSize {
+			thirdOnce.Do(func() { close(thirdServed) })
+		}
+	}))
+	defer src.Close()
+	defer releaseOnce.Do(func() { close(releaseMiddle) })
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/out-of-order.bin"}, Options{
+		"out":                       "out-of-order.bin",
+		"split":                     "2",
+		"max-connection-per-server": "2",
+		"min-split-size":            "1",
+		"goaria-http-segment-size":  strconv.Itoa(chunkSize),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-thirdServed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the out-of-order chunk")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status, err := engine.TellStatus(gid, []string{"status", "completedLength", "bitfield"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status["bitfield"] == "a0" {
+			if status["completedLength"] != strconv.Itoa(2*chunkSize) {
+				t.Fatalf("completedLength = %v, want %d", status["completedLength"], 2*chunkSize)
+			}
+			break
+		}
+		if status["status"] == string(StatusError) {
+			t.Fatalf("download errored: %#v", status)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bitfield = %v, want a0 for completed chunks 0 and 2", status["bitfield"])
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	releaseOnce.Do(func() { close(releaseMiddle) })
+	waitForStatus(t, engine, gid, StatusComplete)
+	status, err := engine.TellStatus(gid, []string{"bitfield"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["bitfield"] != "e0" {
+		t.Fatalf("final bitfield = %v, want e0", status["bitfield"])
+	}
+}
+
+func TestSegmentedHTTPDownloadDowngradesWhenServerIgnoresRange(t *testing.T) {
+	data := bytes.Repeat([]byte("range-downgrade-"), 256)
+	var ignoredRanges atomic.Int32
+	var fullRequests atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDownloadHeaders(w, data)
+		if r.Method == http.MethodHead {
+			return
+		}
+		if r.Header.Get("Range") != "" {
+			ignoredRanges.Add(1)
+		} else {
+			fullRequests.Add(1)
+		}
+		// Deliberately ignore Range and return the complete representation.
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/downgrade.bin"}, Options{
+		"out":                       "downgrade.bin",
+		"split":                     "2",
+		"max-connection-per-server": "2",
+		"min-split-size":            "1",
+		"goaria-http-segment-size":  "1K",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "downgrade.bin"), data)
+	if ignoredRanges.Load() == 0 {
+		t.Fatal("server did not receive the attempted Range request")
+	}
+	if got := fullRequests.Load(); got != 1 {
+		t.Fatalf("full request count = %d, want 1", got)
 	}
 }
 
@@ -521,6 +645,230 @@ func TestDownloadSpeedTrackerAggregatesConcurrentWorkers(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for aggregate download speed")
+}
+
+func TestRateLimiterWaitHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- newRateLimiter(1).wait(ctx, 2)
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wait error = %v, want context.Canceled", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("rate limiter did not stop after context cancellation")
+	}
+}
+
+func TestCanceledRateLimiterWaitDoesNotPoisonSharedLimiter(t *testing.T) {
+	limiter := newRateLimiter(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- limiter.wait(ctx, 2) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("wait error = %v, want context.Canceled", err)
+	}
+	limiter.mu.Lock()
+	remaining := time.Until(limiter.next)
+	limiter.mu.Unlock()
+	if remaining > time.Second {
+		t.Fatalf("canceled reservation retained %v of shared bandwidth debt, want at most one byte", remaining)
+	}
+}
+
+func TestDynamicAndOverallRateLimitersRefreshLimits(t *testing.T) {
+	var limit atomic.Int64
+	local := newDynamicRateLimiter(limit.Load)
+	overall := newRateLimiter(1 << 30)
+	local.parent = overall
+
+	if err := local.wait(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	overall.mu.Lock()
+	overallNext := overall.next
+	overall.mu.Unlock()
+	if overallNext.IsZero() {
+		t.Fatal("overall limiter did not reserve bandwidth")
+	}
+
+	limit.Store(1 << 30)
+	if err := local.wait(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	local.mu.Lock()
+	gotLimit := local.limit
+	local.mu.Unlock()
+	if gotLimit != 1<<30 {
+		t.Fatalf("dynamic limit = %d, want %d", gotLimit, int64(1<<30))
+	}
+}
+
+func TestRateLimiterDoesNotBankIdleCreditOrDoubleDelayParents(t *testing.T) {
+	now := time.Now()
+	limiter := newRateLimiter(100)
+	if got := limiter.reservationDeadline(now, 100).Sub(now); got != time.Second {
+		t.Fatalf("first reservation delay = %v, want 1s", got)
+	}
+	idleNow := now.Add(10 * time.Second)
+	if got := limiter.reservationDeadline(idleNow, 100).Sub(idleNow); got != time.Second {
+		t.Fatalf("reservation after idle = %v, want 1s without banked credit", got)
+	}
+
+	child := newRateLimiter(100)
+	child.parent = newRateLimiter(100)
+	if got := child.reservationDeadline(now, 100).Sub(now); got != time.Second {
+		t.Fatalf("composed limiter delay = %v, want max(parent, child)=1s", got)
+	}
+}
+
+func TestOverflowSafeTransferArithmetic(t *testing.T) {
+	if meetsSegmentedMinimum(math.MaxInt64, math.MaxInt64, true) {
+		t.Fatal("overflowing twice-min-split comparison unexpectedly enabled segmentation")
+	}
+	if !meetsSegmentedMinimum(8<<20, 1, false) {
+		t.Fatal("default segmented minimum rejected the 8 MiB floor")
+	}
+	if got := bytesPerSecond(math.MaxInt64, time.Nanosecond); got != math.MaxInt64 {
+		t.Fatalf("overflow-safe byte rate = %d, want MaxInt64", got)
+	}
+}
+
+func TestParseSizePreservesExactInt64Boundary(t *testing.T) {
+	maxText := strconv.FormatInt(math.MaxInt64, 10)
+	if got, err := parseSizeValue(maxText); err != nil || got != math.MaxInt64 {
+		t.Fatalf("parseSizeValue(MaxInt64) = %d, %v", got, err)
+	}
+	if _, err := parseSizeValue("9223372036854775808"); err == nil {
+		t.Fatal("parseSizeValue accepted MaxInt64+1")
+	}
+	if got, err := parseSizeValue("1.5K"); err != nil || got != 1536 {
+		t.Fatalf("parseSizeValue(1.5K) = %d, %v; want 1536", got, err)
+	}
+}
+
+func TestOptionValidationRejectsUnsafePersistenceAndDurationValues(t *testing.T) {
+	tooMany := make([]string, maxDownloadOptionListItems+1)
+	for name, opts := range map[string]Options{
+		"duration overflow": {
+			"timeout": strconv.FormatInt(int64(math.MaxInt64)/int64(time.Second)+1, 10),
+		},
+		"torrent size above absolute bound": {
+			"goaria-max-torrent-size": strconv.FormatInt(maxSupportedTorrentSize+1, 10),
+		},
+		"line break":           {"out": "unsafe\nname"},
+		"edge whitespace":      {"out": " trailing "},
+		"oversized value list": {"header": tooMany},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateOptionValues(opts); err == nil {
+				t.Fatalf("validateOptionValues(%#v) unexpectedly succeeded", opts)
+			}
+		})
+	}
+}
+
+func TestMakeChunksCapsTaskCountAndHandlesMaxLength(t *testing.T) {
+	total := int64(^uint64(0) >> 1)
+	chunks := makeChunks(total, 1)
+	if got := len(chunks); got > maxHTTPSegmentCount {
+		t.Fatalf("chunk count = %d, want at most %d", got, maxHTTPSegmentCount)
+	}
+	if len(chunks) == 0 || chunks[0].start != 0 || chunks[len(chunks)-1].end != total-1 {
+		t.Fatalf("chunks do not cover [0,%d]: first=%#v last=%#v", total-1, chunks[0], chunks[len(chunks)-1])
+	}
+}
+
+func TestOpenRangeMustReachKnownRepresentationEnd(t *testing.T) {
+	resp := &http.Response{
+		Header:        http.Header{"Content-Range": []string{"bytes 5-7/*"}},
+		ContentLength: 3,
+	}
+	if _, err := validateOpenRangeResponse(resp, 5, 10); err == nil {
+		t.Fatal("accepted an open range that stopped before the known representation end")
+	}
+	if cr, err := validateOpenRangeResponse(resp, 5, -1); err != nil || cr.end != 7 {
+		t.Fatalf("unknown-total open range = %#v, %v; want end 7, nil", cr, err)
+	}
+}
+
+func TestOutputPathReservationsPreventConcurrentWriters(t *testing.T) {
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	path := filepath.Join(t.TempDir(), "shared.bin")
+	first, err := engine.reserveOutputPath(path, "first", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != path {
+		t.Fatalf("first reservation = %q, want %q", first, path)
+	}
+	second, err := engine.reserveOutputPath(path, "second", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := path + ".1"; second != want {
+		t.Fatalf("second reservation = %q, want %q", second, want)
+	}
+	if _, err := engine.reserveOutputPath(path, "third", false); err == nil {
+		t.Fatal("concurrent reservation without auto-renaming unexpectedly succeeded")
+	}
+
+	engine.releaseOutputPaths("first")
+	if got, err := engine.reserveOutputPath(path, "third", false); err != nil || got != path {
+		t.Fatalf("reservation after release = %q, %v; want %q, nil", got, err, path)
+	}
+}
+
+func TestOutputPathReservationCanonicalizesSymlinkedDirectories(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := filepath.Join(root, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	engine := &Engine{}
+	realPath := filepath.Join(realDir, "shared.bin")
+	if _, err := engine.reserveOutputPath(realPath, "real-owner", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.reserveOutputPath(filepath.Join(linkDir, "shared.bin"), "link-owner", false); err == nil {
+		t.Fatal("symlink alias bypassed output-path reservation")
+	}
+}
+
+func TestOutputPathReservationCanonicalizesBrokenFinalSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(t.TempDir(), "not-created.bin")
+	link := filepath.Join(root, "output.bin")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	got, err := outputPathReservationKey(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.Abs(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Clean(want) {
+		t.Fatalf("broken symlink reservation key = %q, want %q", got, filepath.Clean(want))
+	}
 }
 
 func TestQueuePauseUnpauseAndChangePosition(t *testing.T) {

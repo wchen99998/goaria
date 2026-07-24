@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 func (e *Engine) scheduler() {
@@ -32,9 +34,15 @@ func (e *Engine) schedule() {
 	var starts []startDownload
 	e.mu.Lock()
 	maxActive := optionInt(e.global, "max-concurrent-downloads", e.cfg.MaxConcurrentDownloads)
-	for e.ctx.Err() == nil && len(e.active) < maxActive && len(e.waiting) > 0 {
+	candidates := len(e.waiting)
+	for e.ctx.Err() == nil && len(e.active) < maxActive && len(e.waiting) > 0 && candidates > 0 {
 		gid := e.waiting[0]
 		e.waiting = e.waiting[1:]
+		candidates--
+		if _, running := e.active[gid]; running {
+			e.waiting = append(e.waiting, gid)
+			continue
+		}
 		d := e.downloads[gid]
 		if d == nil {
 			continue
@@ -71,6 +79,8 @@ func (e *Engine) schedule() {
 
 func (e *Engine) finishDownload(d *Download, runCtx context.Context, err error) {
 	var notification string
+	var cancel context.CancelFunc
+	terminal := false
 	e.mu.Lock()
 	d.mu.Lock()
 	if d.ctx != runCtx {
@@ -82,24 +92,55 @@ func (e *Engine) finishDownload(d *Download, runCtx context.Context, err error) 
 		return
 	}
 	delete(e.active, d.gid)
+	retainReservations := d.status == StatusWaiting && d.retainReservationsAfterRun == runCtx
+	if d.retainReservationsAfterRun == runCtx {
+		d.retainReservationsAfterRun = nil
+	}
+	if d.pathResetAfterRun == runCtx {
+		d.path = ""
+		d.dir = optionString(d.options, "dir")
+		d.out = optionString(d.options, "out")
+		d.pathResetAfterRun = nil
+	}
+	if d.reservationTransitionAfterRun == runCtx {
+		// The old torrent runtime can no longer write. Drop its obsolete paths
+		// while retaining the replacement run's complete reservation set.
+		if replaceErr := e.replaceOutputPaths(d.reservationPathsAfterRun, d.gid); replaceErr != nil {
+			e.log.Error("failed to finalize torrent output reservation transition",
+				zap.String("gid", d.gid),
+				zap.Error(replaceErr),
+			)
+			retainReservations = false
+		}
+		d.reservationTransitionAfterRun = nil
+		d.reservationPathsAfterRun = nil
+	}
+	d.ctx = nil
 	// The torrent client is closed once runTorrentDownload returns. Drop the
 	// runtime so the client's per-piece and per-peer state can be collected;
 	// metadata queries fall back to d.torrentData.
 	d.torrent = nil
 	if d.status == StatusActive {
+		cancel = d.cancel
 		d.cancel = nil
 		d.connections = 0
 		d.downloadBPS = 0
 		d.stoppedAt = time.Now()
 		if err == nil {
 			d.status = StatusComplete
-			if d.totalLength > 0 {
+			metadataOnly := d.kind == downloadKindURI && optionBool(d.options, "dry-run") ||
+				d.kind == downloadKindTorrent && optionBool(d.options, "bt-metadata-only")
+			if d.totalLength > 0 && !metadataOnly {
 				d.completedLen = d.totalLength
 			} else if d.completedLen > 0 {
 				d.totalLength = d.completedLen
 			}
 			notification = "aria2.onDownloadComplete"
-		} else if e.ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		} else if e.ctx.Err() != nil {
+			// Engine shutdown is not a user pause. Persist the interrupted item as
+			// waiting so a saved session resumes it on the next process start.
+			d.status = StatusWaiting
+		} else if errors.Is(err, context.Canceled) {
 			d.status = StatusPaused
 		} else {
 			d.status = StatusError
@@ -107,12 +148,19 @@ func (e *Engine) finishDownload(d *Download, runCtx context.Context, err error) 
 			d.errorMessage = err.Error()
 			notification = "aria2.onDownloadError"
 		}
-		if isTerminal(d.status) {
-			e.appendStoppedLocked(d.gid)
-		}
+		terminal = isTerminal(d.status)
 	}
 	d.mu.Unlock()
+	if terminal {
+		e.appendStoppedLocked(d.gid)
+	}
+	if !retainReservations {
+		e.releaseOutputPaths(d.gid)
+	}
 	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if notification != "" {
 		e.notify(notification, d.gid)
 	}
@@ -120,7 +168,7 @@ func (e *Engine) finishDownload(d *Download, runCtx context.Context, err error) 
 	e.saveSessionBestEffort()
 }
 
-func (e *Engine) remove(gid string, force bool) (string, error) {
+func (e *Engine) remove(gid string) (string, error) {
 	e.mu.Lock()
 	d, err := e.findDownloadLocked(gid)
 	if err != nil {
@@ -128,7 +176,6 @@ func (e *Engine) remove(gid string, force bool) (string, error) {
 		return "", err
 	}
 	e.waiting = removeString(e.waiting, d.gid)
-	delete(e.active, d.gid)
 	d.mu.Lock()
 	if isTerminal(d.status) {
 		d.mu.Unlock()
@@ -141,8 +188,8 @@ func (e *Engine) remove(gid string, force bool) (string, error) {
 	d.connections = 0
 	d.downloadBPS = 0
 	d.stoppedAt = time.Now()
-	e.appendStoppedLocked(d.gid)
 	d.mu.Unlock()
+	e.appendStoppedLocked(d.gid)
 	e.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -153,7 +200,7 @@ func (e *Engine) remove(gid string, force bool) (string, error) {
 	return d.gid, nil
 }
 
-func (e *Engine) pause(gid string, force bool) (string, error) {
+func (e *Engine) pause(gid string) (string, error) {
 	e.mu.Lock()
 	d, err := e.findDownloadLocked(gid)
 	if err != nil {
@@ -167,7 +214,6 @@ func (e *Engine) pause(gid string, force bool) (string, error) {
 		return "", fmt.Errorf("cannot pause stopped download")
 	}
 	e.waiting = removeString(e.waiting, d.gid)
-	delete(e.active, d.gid)
 	cancel := d.cancel
 	d.cancel = nil
 	d.status = StatusPaused
@@ -204,13 +250,49 @@ func (e *Engine) appendStoppedLocked(gid string) {
 		e.stoppedSet[gid] = struct{}{}
 		e.stoppedTotal++
 	}
+	e.pruneStoppedLocked()
+}
+
+func (e *Engine) pruneStoppedLocked() {
 	maxResult := optionInt(e.global, "max-download-result", e.cfg.MaxDownloadResult)
-	for maxResult > 0 && len(e.stopped) > maxResult {
-		old := e.stopped[0]
-		e.stopped = e.stopped[1:]
-		delete(e.stoppedSet, old)
-		delete(e.downloads, old)
+	if maxResult < 0 {
+		maxResult = 0
 	}
+	keepUnfinished := optionBoolDefault(e.global, "keep-unfinished-download-result", true)
+	isProtected := func(gid string) bool {
+		if !keepUnfinished {
+			return false
+		}
+		d := e.downloads[gid]
+		if d == nil {
+			return false
+		}
+		d.mu.RLock()
+		protected := d.status == StatusError
+		d.mu.RUnlock()
+		return protected
+	}
+	prunable := 0
+	for _, gid := range e.stopped {
+		if !isProtected(gid) {
+			prunable++
+		}
+	}
+	excess := prunable - maxResult
+	if excess <= 0 {
+		return
+	}
+	kept := e.stopped[:0]
+	for _, gid := range e.stopped {
+		if excess > 0 && !isProtected(gid) {
+			delete(e.stoppedSet, gid)
+			delete(e.downloads, gid)
+			excess--
+			continue
+		}
+		kept = append(kept, gid)
+	}
+	e.stopped = kept
 }
 
 func (e *Engine) signal() {
@@ -221,6 +303,9 @@ func (e *Engine) signal() {
 }
 
 func (e *Engine) findDownloadLocked(gid string) (*Download, error) {
+	if gid == "" {
+		return nil, ErrNotFound
+	}
 	if d := e.downloads[gid]; d != nil {
 		return d, nil
 	}

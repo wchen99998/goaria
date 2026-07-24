@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/wchen99998/goaria"
@@ -18,6 +19,10 @@ const (
 	rpcInvalidParams  = -32602
 	rpcInternalError  = -32603
 	rpcAriaError      = 1
+	maxBatchCalls     = 64
+	maxMulticallCalls = 64
+	maxRPCIDStringLen = 64
+	maxSafeIntegerID  = int64(1<<53 - 1)
 )
 
 var rpcMethods = []string{
@@ -80,6 +85,21 @@ type rpcResponse struct {
 	Error   *rpcErrorBody    `json:"error,omitempty"`
 }
 
+func (r rpcResponse) MarshalJSON() ([]byte, error) {
+	if r.Error != nil {
+		return json.Marshal(struct {
+			JSONRPC string           `json:"jsonrpc"`
+			ID      *json.RawMessage `json:"id"`
+			Error   *rpcErrorBody    `json:"error"`
+		}{r.JSONRPC, r.ID, r.Error})
+	}
+	return json.Marshal(struct {
+		JSONRPC string           `json:"jsonrpc"`
+		ID      *json.RawMessage `json:"id"`
+		Result  any              `json:"result"`
+	}{r.JSONRPC, r.ID, r.Result})
+}
+
 type rpcErrorBody struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
@@ -102,14 +122,88 @@ func NewHandler(engine *goaria.Engine, secret string) *Handler {
 	return NewRPCHandler(engine, secret)
 }
 
+func (h *RPCHandler) payloadProvesSecret(payload []byte) bool {
+	if h.secret == "" {
+		return true
+	}
+	payload = bytes.TrimSpace(payload)
+	var calls []json.RawMessage
+	if len(payload) > 0 && payload[0] == '[' {
+		var err error
+		calls, err = decodeRawArrayLimited(payload, maxBatchCalls)
+		if err != nil {
+			return false
+		}
+	} else {
+		calls = []json.RawMessage{payload}
+	}
+	for _, raw := range calls {
+		call, err := parseCall(raw)
+		if err != nil || call.JSONRPC != "2.0" || call.Method == "" {
+			continue
+		}
+		if call.Method == "system.multicall" {
+			if h.multicallProvesSecret(call.Params) {
+				return true
+			}
+			continue
+		}
+		if methodNeedsSecret(call.Method) && len(call.Params) > 0 && h.matchesSecretParam(call.Params[0]) {
+			return true
+		}
+	}
+	return false
+}
+
+func methodNeedsSecret(method string) bool {
+	return method != "system.listMethods" && method != "system.listNotifications" && method != "system.multicall"
+}
+
+func (h *RPCHandler) matchesSecretParam(raw json.RawMessage) bool {
+	var token string
+	if err := decodeUseNumber(raw, &token); err != nil {
+		return false
+	}
+	want := "token:" + h.secret
+	return len(token) == len(want) && subtle.ConstantTimeCompare([]byte(token), []byte(want)) == 1
+}
+
+func (h *RPCHandler) multicallProvesSecret(params []json.RawMessage) bool {
+	if len(params) != 1 {
+		return false
+	}
+	calls, err := decodeRawArrayLimited(params[0], maxMulticallCalls)
+	if err != nil {
+		return false
+	}
+	for _, raw := range calls {
+		obj, err := decodeRawObjectLimited(raw, 4)
+		if err != nil {
+			continue
+		}
+		var method string
+		if err := decodeUseNumber(obj["methodName"], &method); err != nil || !methodNeedsSecret(method) {
+			continue
+		}
+		callParams, err := decodeRawArrayLimited(obj["params"], maxRPCParams)
+		if err == nil && len(callParams) > 0 && h.matchesSecretParam(callParams[0]) {
+			return true
+		}
+	}
+	return false
+}
+
 func (h *RPCHandler) HandlePayload(payload []byte) ([]byte, bool) {
 	payload = bytes.TrimSpace(payload)
 	if len(payload) == 0 {
-		return mustJSON(errorResponse(nil, rpcInvalidRequest, "Invalid Request")), true
+		return mustJSON(errorResponse(nil, rpcParseError, "Parse error")), true
 	}
 	if payload[0] == '[' {
-		var raws []json.RawMessage
-		if err := decodeUseNumber(payload, &raws); err != nil {
+		raws, err := decodeRawArrayLimited(payload, maxBatchCalls)
+		if err != nil {
+			if errors.Is(err, errJSONCollectionTooLarge) {
+				return mustJSON(errorResponse(nil, rpcInvalidRequest, "Invalid Request")), true
+			}
 			return mustJSON(errorResponse(nil, rpcParseError, "Parse error")), true
 		}
 		if len(raws) == 0 {
@@ -138,6 +232,11 @@ func (h *RPCHandler) handleOne(raw []byte) (rpcResponse, bool) {
 	if err != nil {
 		var ce callError
 		if errors.As(err, &ce) {
+			// A structurally valid JSON-RPC notification never receives a
+			// response, including when its params member has the wrong shape.
+			if ce.code == rpcInvalidParams && !call.HasID && call.JSONRPC == "2.0" && call.Method != "" {
+				return rpcResponse{}, false
+			}
 			return errorResponse(call.ID, ce.code, ce.msg), true
 		}
 		if isJSONParseError(err) {
@@ -166,8 +265,8 @@ func (h *RPCHandler) handleOne(raw []byte) (rpcResponse, bool) {
 }
 
 func parseCall(raw []byte) (rpcCall, error) {
-	var obj map[string]json.RawMessage
-	if err := decodeUseNumber(raw, &obj); err != nil {
+	obj, err := decodeRawObjectLimited(raw, maxRPCObjectFields)
+	if err != nil {
 		return rpcCall{}, err
 	}
 	var call rpcCall
@@ -178,13 +277,18 @@ func parseCall(raw []byte) (rpcCall, error) {
 		_ = decodeUseNumber(v, &call.Method)
 	}
 	if v, ok := obj["id"]; ok {
+		if !validRPCID(v) {
+			return rpcCall{}, callError{code: rpcInvalidRequest, msg: "Invalid Request"}
+		}
 		idCopy := append(json.RawMessage(nil), v...)
 		call.ID = &idCopy
 		call.HasID = true
 	}
 	if v, ok := obj["params"]; ok {
-		if len(v) > 0 && v[0] == '[' {
-			if err := decodeUseNumber(v, &call.Params); err != nil {
+		trimmed := bytes.TrimSpace(v)
+		if len(trimmed) > 0 && trimmed[0] == '[' {
+			call.Params, err = decodeRawArrayLimited(trimmed, maxRPCParams)
+			if err != nil {
 				return call, callError{code: rpcInvalidParams, msg: "Invalid params"}
 			}
 		} else {
@@ -192,6 +296,24 @@ func parseCall(raw []byte) (rpcCall, error) {
 		}
 	}
 	return call, nil
+}
+
+func validRPCID(raw json.RawMessage) bool {
+	var value any
+	if err := decodeUseNumber(raw, &value); err != nil {
+		return false
+	}
+	switch value := value.(type) {
+	case nil:
+		return true
+	case string:
+		return len(value) <= maxRPCIDStringLen
+	case json.Number:
+		n, err := strconv.ParseInt(value.String(), 10, 64)
+		return err == nil && n >= -maxSafeIntegerID && n <= maxSafeIntegerID
+	default:
+		return false
+	}
 }
 
 func (h *RPCHandler) stripSecret(method string, params []json.RawMessage) ([]json.RawMessage, error) {

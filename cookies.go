@@ -1,12 +1,19 @@
 package goaria
 
 import (
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	maxCookieFileSize    = 16 << 20
+	maxCookiesPerRequest = 4096
+	maxCookiePayloadSize = 1 << 20
 )
 
 type loadedCookieJar struct {
@@ -41,8 +48,16 @@ func loadedCookiesForRequest(u *url.URL, path string) []*http.Cookie {
 	if u == nil || path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	if info, err := f.Stat(); err != nil || info.Size() > maxCookieFileSize {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxCookieFileSize+1))
+	if err != nil || len(data) > maxCookieFileSize {
 		return nil
 	}
 	host := strings.ToLower(u.Hostname())
@@ -56,6 +71,7 @@ func loadedCookiesForRequest(u *url.URL, path string) []*http.Cookie {
 	secureReq := u.Scheme == "https"
 	now := time.Now().Unix()
 	var out []*http.Cookie
+	payloadSize := 0
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -82,6 +98,10 @@ func loadedCookiesForRequest(u *url.URL, path string) []*http.Cookie {
 		}
 		if !cookieDomainMatches(host, domain, includeSubdomains) || !cookiePathMatches(reqPath, cookiePath) {
 			continue
+		}
+		payloadSize += len(name) + len(value)
+		if len(out) >= maxCookiesPerRequest || payloadSize > maxCookiePayloadSize {
+			break
 		}
 		out = append(out, &http.Cookie{Name: name, Value: value})
 	}

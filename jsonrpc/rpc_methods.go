@@ -16,11 +16,17 @@ var notificationMethods = []string{
 }
 
 func (h *RPCHandler) invoke(method string, params []json.RawMessage) (any, error) {
+	if err := validateParamCount(method, len(params)); err != nil {
+		return nil, err
+	}
 	switch method {
 	case "aria2.addUri":
 		uris, err := stringSliceParam(params, 0)
 		if err != nil {
 			return nil, err
+		}
+		if len(uris) == 0 {
+			return nil, callError{code: rpcInvalidParams, msg: "Invalid params"}
 		}
 		opts, err := optionsParam(params, 1, false)
 		if err != nil {
@@ -51,6 +57,9 @@ func (h *RPCHandler) invoke(method string, params []json.RawMessage) (any, error
 					return nil, err
 				}
 			} else {
+				if len(params) > 3 {
+					return nil, callError{code: rpcInvalidParams, msg: "Invalid params"}
+				}
 				opts, err = optionsParam(params, 1, false)
 				if err != nil {
 					return nil, err
@@ -275,25 +284,66 @@ func (h *RPCHandler) invoke(method string, params []json.RawMessage) (any, error
 	}
 }
 
+func validateParamCount(method string, count int) error {
+	minParams, maxParams := -1, -1
+	switch method {
+	case "aria2.addUri", "aria2.addMetalink":
+		minParams, maxParams = 1, 3
+	case "aria2.addTorrent":
+		minParams, maxParams = 1, 4
+	case "aria2.remove", "aria2.forceRemove", "aria2.pause", "aria2.forcePause", "aria2.unpause", "aria2.getUris", "aria2.getFiles", "aria2.getPeers", "aria2.getServers", "aria2.getOption", "aria2.removeDownloadResult":
+		minParams, maxParams = 1, 1
+	case "aria2.pauseAll", "aria2.forcePauseAll", "aria2.unpauseAll", "aria2.getGlobalOption", "aria2.getGlobalStat", "aria2.purgeDownloadResult", "aria2.getVersion", "aria2.getSessionInfo", "aria2.shutdown", "aria2.forceShutdown", "aria2.saveSession", "system.listMethods", "system.listNotifications":
+		minParams, maxParams = 0, 0
+	case "aria2.tellStatus":
+		minParams, maxParams = 1, 2
+	case "aria2.tellActive":
+		minParams, maxParams = 0, 1
+	case "aria2.tellWaiting", "aria2.tellStopped":
+		minParams, maxParams = 2, 3
+	case "aria2.changePosition":
+		minParams, maxParams = 3, 3
+	case "aria2.changeUri":
+		minParams, maxParams = 4, 5
+	case "aria2.changeOption":
+		minParams, maxParams = 2, 2
+	case "aria2.changeGlobalOption", "system.multicall":
+		minParams, maxParams = 1, 1
+	}
+	if minParams >= 0 && (count < minParams || count > maxParams) {
+		return callError{code: rpcInvalidParams, msg: "Invalid params"}
+	}
+	return nil
+}
+
 func (h *RPCHandler) multicall(params []json.RawMessage) (any, error) {
-	if len(params) < 1 {
-		return nil, callError{code: rpcInvalidParams, msg: "Invalid params"}
-	}
-	var calls []struct {
-		MethodName string            `json:"methodName"`
-		Params     []json.RawMessage `json:"params"`
-	}
-	if err := decodeUseNumber(params[0], &calls); err != nil {
+	calls, err := decodeRawArrayLimited(params[0], maxMulticallCalls)
+	if err != nil {
 		return nil, callError{code: rpcInvalidParams, msg: "Invalid params"}
 	}
 	out := make([]any, 0, len(calls))
-	for _, c := range calls {
-		p, err := h.stripSecret(c.MethodName, c.Params)
+	for _, encodedCall := range calls {
+		call, err := decodeRawObjectLimited(encodedCall, 2)
+		if err != nil || len(call) != 2 {
+			out = append(out, map[string]any{"faultCode": rpcInvalidParams, "faultString": "Invalid params"})
+			continue
+		}
+		var method string
+		if err := decodeUseNumber(call["methodName"], &method); err != nil || method == "" || method == "system.multicall" {
+			out = append(out, map[string]any{"faultCode": rpcInvalidParams, "faultString": "Invalid params"})
+			continue
+		}
+		callParams, err := decodeRawArrayLimited(call["params"], maxRPCParams)
+		if err != nil {
+			out = append(out, map[string]any{"faultCode": rpcInvalidParams, "faultString": "Invalid params"})
+			continue
+		}
+		p, err := h.stripSecret(method, callParams)
 		if err != nil {
 			out = append(out, map[string]any{"faultCode": rpcAriaError, "faultString": err.Error()})
 			continue
 		}
-		result, err := h.invoke(c.MethodName, p)
+		result, err := h.invoke(method, p)
 		if err != nil {
 			out = append(out, map[string]any{"faultCode": rpcCode(err), "faultString": err.Error()})
 			continue

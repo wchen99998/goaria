@@ -99,6 +99,7 @@
     "https-proxy-passwd": "e2e-https-proxy-pass",
     "https-proxy-user": "e2e-https-proxy-user",
     "index-out": ["1=e2e-renamed.bin"],
+    "keep-unfinished-download-result": "true",
     "load-cookies": "${TEMP}/cookies.txt",
     "lowest-speed-limit": "0",
     "listen-port": "0",

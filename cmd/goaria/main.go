@@ -32,41 +32,63 @@ func run() error {
 	return runDownload(os.Args[1:])
 }
 
-func runDaemon(args []string) error {
+type daemonOptions struct {
+	addr           string
+	dir            string
+	inputFile      string
+	saveSession    string
+	secret         string
+	logLevel       string
+	maxRequestSize int64
+}
+
+func newDaemonFlagSet(opts *daemonOptions) *flag.FlagSet {
 	fs := flag.NewFlagSet("goaria daemon", flag.ExitOnError)
-	addr := fs.String("listen", jsonrpc.DefaultAddr, "RPC listen address")
-	dir := fs.String("dir", ".", "download directory")
-	inputFile := fs.String("input-file", "", "aria2-style session/input file to load at startup")
-	saveSession := fs.String("save-session", "", "aria2-style session file to save automatically")
-	secret := fs.String("rpc-secret", "", "aria2 RPC secret token")
-	logLevel := fs.String("log-level", "info", "debug, info, warn, or error")
+	fs.StringVar(&opts.addr, "listen", jsonrpc.DefaultAddr, "RPC listen address")
+	fs.StringVar(&opts.dir, "dir", ".", "download directory")
+	fs.StringVar(&opts.inputFile, "input-file", "", "aria2-style session/input file to load at startup")
+	fs.StringVar(&opts.saveSession, "save-session", "", "aria2-style session file to save automatically")
+	fs.StringVar(&opts.secret, "rpc-secret", "", "aria2 RPC secret token")
+	fs.Int64Var(&opts.maxRequestSize, "rpc-max-request-size", jsonrpc.DefaultMaxRequestSize, "maximum JSON-RPC request size in bytes")
+	fs.StringVar(&opts.logLevel, "log-level", "info", "debug, info, warn, or error")
+	return fs
+}
+
+func runDaemon(args []string) (retErr error) {
+	var opts daemonOptions
+	fs := newDaemonFlagSet(&opts)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	log, err := newLogger(*logLevel)
+	log, err := newLogger(opts.logLevel)
 	if err != nil {
 		return err
 	}
 	defer log.Sync()
 
 	engine, err := goaria.NewEngine(goaria.Config{
-		Dir:         *dir,
-		InputFile:   *inputFile,
-		SaveSession: *saveSession,
+		Dir:         opts.dir,
+		InputFile:   opts.inputFile,
+		SaveSession: opts.saveSession,
 		Logger:      log,
 	})
 	if err != nil {
 		return err
 	}
-	defer engine.Close(context.Background())
+	defer mergeCloseError(&retErr, engine.Close)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	server := jsonrpc.NewServer(engine, jsonrpc.Config{Addr: *addr, Secret: *secret, Logger: log})
+	server := jsonrpc.NewServer(engine, jsonrpc.Config{
+		Addr:           opts.addr,
+		MaxRequestSize: opts.maxRequestSize,
+		Secret:         opts.secret,
+		Logger:         log,
+	})
 	return server.ListenAndServe(ctx)
 }
 
-func runDownload(args []string) error {
+func runDownload(args []string) (retErr error) {
 	fs := flag.NewFlagSet("goaria", flag.ExitOnError)
 	dir := fs.String("dir", ".", "download directory")
 	out := fs.String("out", "", "output filename for a single URL")
@@ -92,7 +114,7 @@ func runDownload(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer engine.Close(context.Background())
+	defer mergeCloseError(&retErr, engine.Close)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -115,6 +137,12 @@ func runDownload(args []string) error {
 		gids = append(gids, gid)
 	}
 	return waitForDownloads(ctx, engine, gids)
+}
+
+func mergeCloseError(result *error, closeFn func(context.Context) error) {
+	if err := closeFn(context.Background()); err != nil {
+		*result = errors.Join(*result, err)
+	}
 }
 
 func waitForDownloads(ctx context.Context, engine *goaria.Engine, gids []string) error {

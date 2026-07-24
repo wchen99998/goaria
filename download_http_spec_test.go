@@ -7,6 +7,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,6 +21,16 @@ import (
 	"testing"
 	"time"
 )
+
+type closeTrackingResponseBody struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (b *closeTrackingResponseBody) Close() error {
+	b.closed.Store(true)
+	return nil
+}
 
 func TestHTTPRequestOptionsAndRemoteTime(t *testing.T) {
 	data := []byte("option content")
@@ -96,6 +108,128 @@ func TestHeaderUserAgentOverridesOptionUserAgent(t *testing.T) {
 	}
 	if got := req.Header.Get("X-Goaria-Test"); got != "ok" {
 		t.Fatalf("X-Goaria-Test = %q", got)
+	}
+}
+
+func TestHeaderHostOverridesRequestHost(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://origin.example/file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyRequestOptions(req, Options{
+		"header": []string{"Host: mirror.example:8443"},
+	})
+	if req.Host != "mirror.example:8443" {
+		t.Fatalf("Request.Host = %q, want mirror.example:8443", req.Host)
+	}
+	if got := req.Header.Get("Host"); got != "" {
+		t.Fatalf("ordinary Host header = %q, want empty", got)
+	}
+}
+
+func TestHostOverrideSurvivesRedirects(t *testing.T) {
+	data := []byte("redirect host")
+	var seen atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != "mirror.example" {
+			t.Errorf("request %s Host = %q, want mirror.example", r.URL.Path, r.Host)
+		}
+		seen.Add(1)
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/final", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/start"}, Options{
+		"out":    "host.bin",
+		"split":  "1",
+		"header": []string{"Host: mirror.example"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	if seen.Load() < 2 {
+		t.Fatalf("server saw %d requests, want redirect and final request", seen.Load())
+	}
+	assertFileEquals(t, filepath.Join(dir, "host.bin"), data)
+}
+
+func TestWildcardRefererStripsURLCredentials(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://user:secret@example.test/file", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyRequestOptions(req, Options{"referer": "*"})
+	if got := req.Header.Get("Referer"); got != "https://example.test/file" {
+		t.Fatalf("Referer = %q, want credentials stripped", got)
+	}
+}
+
+func TestFilenameFromResponseSanitizesContentDisposition(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{name: "safe.bin", want: "safe.bin"},
+		{name: "../../outside.bin", want: "outside.bin"},
+		{name: "..", want: "index.html"},
+		{name: ".", want: "index.html"},
+		{name: "/", want: "index.html"},
+		{name: `\`, want: "index.html"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{Header: make(http.Header)}
+			resp.Header.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": tt.name}))
+			if got := filenameFromResponse(resp, "https://example.test/fallback.bin"); got != tt.want {
+				t.Fatalf("filenameFromResponse = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFilenameFromResponseSanitizesRedirectURLPath(t *testing.T) {
+	req, err := http.NewRequest(http.MethodGet, "https://example.test/files/%2e%2e", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &http.Response{Header: make(http.Header), Request: req}
+	if got := filenameFromResponse(resp, "https://example.test/fallback.bin"); got != "index.html" {
+		t.Fatalf("filenameFromResponse = %q, want index.html", got)
+	}
+}
+
+func TestFilenameFromURIUsesDecodedURLPath(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{raw: "https://example.test/", want: "index.html"},
+		{raw: "https://example.test/files/", want: "index.html"},
+		{raw: "https://example.test?token=secret#fragment", want: "index.html"},
+		{raw: "https://example.test/files/report%20one.txt?token=secret#fragment", want: "report one.txt"},
+		{raw: "ftp://example.test/pub/archive.tar.gz?mirror=1", want: "archive.tar.gz"},
+		{raw: "https://example.test/files/a%2Fb.txt", want: "b.txt"},
+		{raw: "https://example.test/files/%2e%2e", want: "index.html"},
+		{raw: "https://example.test/%zz?token=secret#fragment", want: "%zz"},
+		{raw: "", want: "index.html"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			if got := filenameFromURI(tt.raw); got != tt.want {
+				t.Fatalf("filenameFromURI(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -197,6 +331,91 @@ func TestHTTPAuthChallengeDoesNotPreemptivelySendURLCredentials(t *testing.T) {
 	}
 }
 
+func TestHTTPAuthChallengeRetriesRedirectedRequest(t *testing.T) {
+	data := []byte("redirected challenge")
+	var protectedRequests atomic.Int32
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/protected", http.StatusFound)
+			return
+		}
+		protectedRequests.Add(1)
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="redirect"`)
+			http.Error(w, "auth required", http.StatusUnauthorized)
+			return
+		}
+		if user != "user" || pass != "pass" {
+			http.Error(w, "bad auth", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/start"}, Options{
+		"out":                 "redirect-auth.bin",
+		"split":               "1",
+		"http-user":           "user",
+		"http-passwd":         "pass",
+		"http-auth-challenge": "true",
+		"use-head":            "false",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	if protectedRequests.Load() != 2 {
+		t.Fatalf("protected request count = %d, want challenge plus retry", protectedRequests.Load())
+	}
+	assertFileEquals(t, filepath.Join(dir, "redirect-auth.bin"), data)
+}
+
+func TestHTTPAuthChallengeDoesNotCrossRedirectOrigins(t *testing.T) {
+	var authenticated atomic.Int32
+	protected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, _, ok := r.BasicAuth(); ok {
+			authenticated.Add(1)
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="cross-origin"`)
+		http.Error(w, "auth required", http.StatusUnauthorized)
+	}))
+	defer protected.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, protected.URL+"/protected", http.StatusFound)
+	}))
+	defer origin.Close()
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{origin.URL + "/start"}, Options{
+		"out":                 "cross-origin-auth.bin",
+		"split":               "1",
+		"max-tries":           "1",
+		"http-user":           "user",
+		"http-passwd":         "pass",
+		"http-auth-challenge": "true",
+		"use-head":            "false",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusError)
+	if got := authenticated.Load(); got != 0 {
+		t.Fatalf("credentials were sent %d times to a cross-origin redirect target", got)
+	}
+}
+
 func TestFallbackURIAfterHTTP404(t *testing.T) {
 	data := []byte("fallback")
 	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +461,8 @@ func TestMaxFileNotFoundFailsBeforeFallback(t *testing.T) {
 	}))
 	defer ok.Close()
 
-	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,6 +559,61 @@ func TestConditionalGetSkipsUnmodifiedDownloadWithoutHEADRequirement(t *testing.
 	}
 }
 
+func TestContinueDoesNotTreatPartialFileAsConditionallyComplete(t *testing.T) {
+	data := []byte("complete resumed representation")
+	const prefixLength = 9
+	var sawRange atomic.Bool
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("If-Modified-Since") != "" || r.Header.Get("If-None-Match") != "" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Header().Set("Accept-Ranges", "bytes")
+			return
+		}
+		if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=%d-", prefixLength) {
+			t.Errorf("Range = %q, want resume from %d", got, prefixLength)
+		} else {
+			sawRange.Store(true)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", prefixLength, len(data)-1, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)-prefixLength))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[prefixLength:])
+	}))
+	defer src.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "resume.bin")
+	if err := os.WriteFile(path, data[:prefixLength], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/resume.bin"}, Options{
+		"out":             "resume.bin",
+		"split":           "1",
+		"continue":        "true",
+		"conditional-get": "true",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	if !sawRange.Load() {
+		t.Fatal("resume request was replaced by a conditional 304")
+	}
+	assertFileEquals(t, path, data)
+}
+
 func TestHTTPAcceptGzipDecompressesBody(t *testing.T) {
 	data := bytes.Repeat([]byte("gzip-data"), 1024)
 	var compressed bytes.Buffer
@@ -418,7 +693,7 @@ func TestHTTPProbeFallsBackToRangeWhenHeadLengthIsUnknown(t *testing.T) {
 	if !sawRange.Load() {
 		t.Fatal("range fallback was not used")
 	}
-	status, err := engine.TellStatus(gid, []string{"totalLength", "files"})
+	status, err := engine.TellStatus(gid, []string{"totalLength", "completedLength", "files"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,9 +701,165 @@ func TestHTTPProbeFallsBackToRangeWhenHeadLengthIsUnknown(t *testing.T) {
 	if status["totalLength"] != want {
 		t.Fatalf("totalLength = %v, want %s", status["totalLength"], want)
 	}
+	if status["completedLength"] != "0" {
+		t.Fatalf("dry-run completedLength = %v, want 0", status["completedLength"])
+	}
 	files := status["files"].([]FileInfo)
 	if files[0].Length != want {
 		t.Fatalf("file length = %v, want %s", files[0].Length, want)
+	}
+	if files[0].CompletedLength != "0" {
+		t.Fatalf("dry-run file completedLength = %v, want 0", files[0].CompletedLength)
+	}
+}
+
+func TestHTTPProbeClosesHEADBodyBeforeRangeFallback(t *testing.T) {
+	headBody := &closeTrackingResponseBody{Reader: strings.NewReader("")}
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.Method {
+		case http.MethodHead:
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Status:        "200 OK",
+				Header:        http.Header{"Accept-Ranges": []string{"bytes"}},
+				Body:          headBody,
+				ContentLength: -1,
+				Request:       req,
+			}, nil
+		case http.MethodGet:
+			if !headBody.closed.Load() {
+				return nil, errors.New("HEAD body still open during range fallback")
+			}
+			return &http.Response{
+				StatusCode:    http.StatusPartialContent,
+				Status:        "206 Partial Content",
+				Header:        http.Header{"Content-Range": []string{"bytes 0-0/1"}},
+				Body:          io.NopCloser(strings.NewReader("x")),
+				ContentLength: 1,
+				Request:       req,
+			}, nil
+		default:
+			return nil, fmt.Errorf("unexpected method %s", req.Method)
+		}
+	})}
+	engine := &Engine{client: client}
+	meta, err := engine.probe(context.Background(), "https://example.test/file", Options{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.Length != 1 || !meta.AcceptRange {
+		t.Fatalf("probe metadata = %#v, want one-byte ranged response", meta)
+	}
+}
+
+func TestHTTPResponseBodyIdleTimeout(t *testing.T) {
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "4")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	started := time.Now()
+	gid, err := engine.AddURI([]string{src.URL + "/stall.bin"}, Options{
+		"out":       "stall.bin",
+		"split":     "1",
+		"use-head":  "false",
+		"timeout":   "1",
+		"max-tries": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusError)
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("idle response timed out after %v, want under 4s", elapsed)
+	}
+	status, err := engine.TellStatus(gid, []string{"errorMessage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := status["errorMessage"].(string); !strings.Contains(message, "response body idle timeout") {
+		t.Fatalf("errorMessage = %q, want idle timeout", message)
+	}
+}
+
+func TestHTTPResponseHeaderTimeout(t *testing.T) {
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer src.Close()
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	started := time.Now()
+	gid, err := engine.AddURI([]string{src.URL + "/headers.bin"}, Options{
+		"out":       "headers.bin",
+		"split":     "1",
+		"use-head":  "false",
+		"timeout":   "1",
+		"max-tries": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusError)
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("response header timeout took %v", elapsed)
+	}
+	status, err := engine.TellStatus(gid, []string{"errorMessage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := status["errorMessage"].(string); !strings.Contains(message, "response header timeout") {
+		t.Fatalf("errorMessage = %q, want response header timeout", message)
+	}
+}
+
+func TestContinueReusesExplicitZeroLengthOutput(t *testing.T) {
+	data := []byte("restarted in place")
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "" {
+			t.Errorf("zero-length resume sent Range %q", got)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "zero.bin")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/zero.bin"}, Options{
+		"out":       "zero.bin",
+		"split":     "1",
+		"continue":  "true",
+		"use-head":  "false",
+		"max-tries": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, path, data)
+	if _, err := os.Stat(path + ".1"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("auto-renamed output exists or stat failed: %v", err)
 	}
 }
 
@@ -493,17 +924,116 @@ func TestSegmentedRangeRequestsUseIdentityEncodingAndSingleRange(t *testing.T) {
 	}
 }
 
-func TestSegmentedRangeRequestsDoNotUseWeakETagAsIfRange(t *testing.T) {
-	data := bytes.Repeat([]byte("weak-if-range-"), 64*1024)
-	var sawRange atomic.Bool
+func TestSegmentedRetryRollsBackFailedAttemptProgress(t *testing.T) {
+	const segmentSize = 16 * 1024
+	data := bytes.Repeat([]byte("r"), 4*segmentSize)
+	var firstRangeAttempts atomic.Int32
+	var otherRanges atomic.Int32
+	retryStarted := make(chan struct{})
+	otherRangesDone := make(chan struct{})
+	releaseRetry := make(chan struct{})
+	var retryStartedOnce, otherRangesOnce, releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseRetry) })
+
 	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
-			w.Header().Set("ETag", `W/"weak-range-etag"`)
 			setDownloadHeaders(w, data)
 			return
 		}
-		if got := r.Header.Get("If-Range"); got != "" {
-			http.Error(w, "weak ETag used as If-Range "+got, http.StatusBadRequest)
+		start, end, _ := parseTestRange(t, r.Header.Get("Range"), int64(len(data)))
+		if start == 0 {
+			if firstRangeAttempts.Add(1) == 1 {
+				length := end - start + 1
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+				w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data[:length/2])
+				return
+			}
+			retryStartedOnce.Do(func() { close(retryStarted) })
+			<-releaseRetry
+			writeRange(w, data, start, end)
+			return
+		}
+		writeRange(w, data, start, end)
+		if otherRanges.Add(1) == 3 {
+			otherRangesOnce.Do(func() { close(otherRangesDone) })
+		}
+	}))
+	defer src.Close()
+
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{src.URL + "/retry-progress.bin"}, Options{
+		"out":                       "retry-progress.bin",
+		"split":                     "4",
+		"max-connection-per-server": "4",
+		"min-split-size":            "1",
+		"goaria-http-segment-size":  "16K",
+		"max-tries":                 "2",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, ready := range map[string]<-chan struct{}{
+		"range retry":  retryStarted,
+		"other ranges": otherRangesDone,
+	} {
+		select {
+		case <-ready:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s", name)
+		}
+	}
+
+	wantCompleted := int64(len(data) - segmentSize)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, err := engine.TellStatus(gid, []string{"completedLength"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		completed, err := strconv.ParseInt(status["completedLength"].(string), 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if completed > wantCompleted {
+			t.Fatalf("completedLength = %d, includes bytes from failed range attempt; want at most %d", completed, wantCompleted)
+		}
+		if completed == wantCompleted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("completedLength = %d, want %d after successful ranges", completed, wantCompleted)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	releaseOnce.Do(func() { close(releaseRetry) })
+	waitForStatus(t, engine, gid, StatusComplete)
+	assertFileEquals(t, filepath.Join(dir, "retry-progress.bin"), data)
+	if firstRangeAttempts.Load() != 2 {
+		t.Fatalf("first range attempts = %d, want 2", firstRangeAttempts.Load())
+	}
+}
+
+func TestSegmentedRangeRequestsDoNotUseWeakETagAsIfRange(t *testing.T) {
+	data := bytes.Repeat([]byte("weak-if-range-"), 64*1024)
+	lastModified := time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC).Format(http.TimeFormat)
+	var sawRange atomic.Bool
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Last-Modified", lastModified)
+		if r.Method == http.MethodHead {
+			w.Header().Set("ETag", `W/"weak-range-etag"`)
+			setDownloadHeaders(w, data)
+			w.Header().Set("Last-Modified", lastModified)
+			return
+		}
+		if got := r.Header.Get("If-Range"); got != lastModified {
+			http.Error(w, "range If-Range = "+got, http.StatusBadRequest)
 			return
 		}
 		start, end, _ := parseTestRange(t, r.Header.Get("Range"), int64(len(data)))
@@ -537,47 +1067,59 @@ func TestSegmentedRangeRequestsDoNotUseWeakETagAsIfRange(t *testing.T) {
 
 func TestSegmentedDownloadRejectsMismatchedContentRange(t *testing.T) {
 	data := bytes.Repeat([]byte("bad-content-range-"), 64*1024)
-	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setDownloadHeaders(w, data)
-		if r.Method == http.MethodHead {
-			return
-		}
-		rng := r.Header.Get("Range")
-		if rng == "" {
-			http.Error(w, "expected Range", http.StatusBadRequest)
-			return
-		}
-		start, end, _ := parseTestRange(t, rng, int64(len(data)))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start+1, end+1, len(data)+1))
-		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(data[start : end+1])
-	}))
-	defer src.Close()
+	tests := map[string]func(start, end, total int64) string{
+		"bounds": func(start, end, total int64) string {
+			return fmt.Sprintf("bytes %d-%d/%d", start+1, end+1, total+1)
+		},
+		"total": func(start, end, total int64) string {
+			return fmt.Sprintf("bytes %d-%d/%d", start, end, total+1)
+		},
+	}
+	for name, contentRange := range tests {
+		t.Run(name, func(t *testing.T) {
+			src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				setDownloadHeaders(w, data)
+				if r.Method == http.MethodHead {
+					return
+				}
+				rng := r.Header.Get("Range")
+				if rng == "" {
+					http.Error(w, "expected Range", http.StatusBadRequest)
+					return
+				}
+				start, end, _ := parseTestRange(t, rng, int64(len(data)))
+				w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+				w.Header().Set("Content-Range", contentRange(start, end, int64(len(data))))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data[start : end+1])
+			}))
+			defer src.Close()
 
-	engine, err := NewEngine(Config{Dir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer engine.Close(context.Background())
-	gid, err := engine.AddURI([]string{src.URL + "/bad-range.bin"}, Options{
-		"out":                       "bad-range.bin",
-		"split":                     "4",
-		"max-connection-per-server": "4",
-		"min-split-size":            "1",
-		"goaria-http-segment-size":  "16K",
-		"max-tries":                 "1",
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForStatus(t, engine, gid, StatusError)
-	status, err := engine.TellStatus(gid, []string{"errorMessage"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(status["errorMessage"].(string), "Content-Range") {
-		t.Fatalf("errorMessage = %#v, want Content-Range", status["errorMessage"])
+			engine, err := NewEngine(Config{Dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close(context.Background())
+			gid, err := engine.AddURI([]string{src.URL + "/bad-range.bin"}, Options{
+				"out":                       "bad-range.bin",
+				"split":                     "4",
+				"max-connection-per-server": "4",
+				"min-split-size":            "1",
+				"goaria-http-segment-size":  "16K",
+				"max-tries":                 "1",
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitForStatus(t, engine, gid, StatusError)
+			status, err := engine.TellStatus(gid, []string{"errorMessage"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(status["errorMessage"].(string), "Content-Range") {
+				t.Fatalf("errorMessage = %#v, want Content-Range", status["errorMessage"])
+			}
+		})
 	}
 }
 

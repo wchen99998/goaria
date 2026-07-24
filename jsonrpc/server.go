@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -21,9 +22,14 @@ import (
 )
 
 const (
-	DefaultAddr           = "127.0.0.1:6800"
-	DefaultPath           = "/jsonrpc"
-	DefaultMaxRequestSize = 2 << 20
+	DefaultAddr             = "127.0.0.1:6800"
+	DefaultPath             = "/jsonrpc"
+	DefaultMaxRequestSize   = 2 << 20
+	webSocketAuthTimeout    = 10 * time.Second
+	maxJSONPCallbackSize    = 256
+	maxWebSocketConnections = 256
+	serverShutdownTimeout   = 10 * time.Second
+	forceShutdownGrace      = 250 * time.Millisecond
 )
 
 type Config struct {
@@ -45,6 +51,20 @@ type Server struct {
 	log      *zap.Logger
 	server   *http.Server
 	upgrader websocket.Upgrader
+
+	wsMu      sync.Mutex
+	wsConns   map[*websocket.Conn]*webSocketState
+	wsClosing bool
+	wsActive  int
+	wsWG      sync.WaitGroup
+}
+
+type webSocketState struct {
+	conn *websocket.Conn
+
+	mu       sync.Mutex
+	handling bool
+	closing  bool
 }
 
 func NewServer(engine *goaria.Engine, cfg Config) *Server {
@@ -66,6 +86,7 @@ func NewServer(engine *goaria.Engine, cfg Config) *Server {
 		path:    cfg.Path,
 		maxBody: cfg.MaxRequestSize,
 		log:     log,
+		wsConns: make(map[*websocket.Conn]*webSocketState),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return cfg.Secret != "" || sameWebSocketOrigin(r)
@@ -91,6 +112,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		Addr:              s.addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    requestHeaderLimit(s.maxBody),
 	}
 	errCh := make(chan error, 1)
 	go func() {
@@ -98,30 +123,88 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		errCh <- s.server.ListenAndServe()
 	}()
 
+	force := false
 	select {
 	case <-ctx.Done():
-	case force := <-s.engine.ShutdownRequests():
+	case force = <-s.engine.ShutdownRequests():
 		if force {
 			s.log.Info("force shutdown requested")
 		} else {
 			s.log.Info("shutdown requested")
 		}
 	case err := <-errCh:
+		s.initiateWebSocketClose()
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 	defer cancel()
-	if err := s.server.Shutdown(shutdownCtx); err != nil {
-		return err
+	var shutdownErr error
+	if force {
+		shutdownErr = s.forceShutdownHTTP()
+	} else {
+		shutdownDone := make(chan error, 1)
+		go func() { shutdownDone <- s.server.Shutdown(shutdownCtx) }()
+		for {
+			select {
+			case shutdownErr = <-shutdownDone:
+				goto shutdownComplete
+			case escalate := <-s.engine.ShutdownRequests():
+				if escalate {
+					var gracefulErr, closeErr error
+					timer := time.NewTimer(forceShutdownGrace)
+					select {
+					case gracefulErr = <-shutdownDone:
+						if !timer.Stop() {
+							<-timer.C
+						}
+					case <-timer.C:
+						closeErr = s.server.Close()
+						gracefulErr = <-shutdownDone
+					}
+					if errors.Is(gracefulErr, http.ErrServerClosed) {
+						gracefulErr = nil
+					}
+					shutdownErr = errors.Join(closeErr, gracefulErr)
+					goto shutdownComplete
+				}
+			}
+		}
+	}
+
+shutdownComplete:
+	if errors.Is(shutdownErr, http.ErrServerClosed) {
+		shutdownErr = nil
+	}
+
+	// Shutdown ignores hijacked connections. Mark active RPCs for close after
+	// their response is written, then bound the wait with the same deadline.
+	s.initiateWebSocketClose()
+	if err := s.waitWebSockets(shutdownCtx); err != nil {
+		s.forceCloseWebSockets()
+		shutdownErr = errors.Join(shutdownErr, err)
 	}
 	if err := <-errCh; !errors.Is(err, http.ErrServerClosed) {
-		return err
+		shutdownErr = errors.Join(shutdownErr, err)
 	}
-	return nil
+	return shutdownErr
+}
+
+func (s *Server) forceShutdownHTTP() error {
+	ctx, cancel := context.WithTimeout(context.Background(), forceShutdownGrace)
+	defer cancel()
+	err := s.server.Shutdown(ctx)
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	closeErr := s.server.Close()
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = nil
+	}
+	return errors.Join(err, closeErr)
 }
 
 func normalizePath(path string) string {
@@ -140,6 +223,10 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	callback := r.URL.Query().Get("jsoncallback")
+	if len(callback) > maxJSONPCallbackSize {
+		http.Error(w, "jsoncallback too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 	if callback != "" && !validJSONPCallback(callback) {
 		http.Error(w, "invalid jsoncallback", http.StatusBadRequest)
 		return
@@ -151,6 +238,10 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, s.maxBody)
 		payload, err = io.ReadAll(r.Body)
 	case http.MethodGet:
+		if int64(len(r.URL.RawQuery)) > requestQueryLimit(s.maxBody) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		payload, err = buildGETPayload(r)
 	default:
 		w.Header().Set("Allow", "GET, POST")
@@ -158,7 +249,16 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if int64(len(payload)) > s.maxBody {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	response, ok := s.rpc.HandlePayload(payload)
@@ -176,17 +276,32 @@ func (s *Server) handleJSONRPC(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if !s.beginWebSocket() {
+		http.Error(w, "websocket unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.endWebSocket()
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.log.Warn("websocket upgrade failed", zap.Error(err))
 		return
 	}
-	defer conn.Close()
-
-	notifications, unsubscribe := s.engine.Subscribe(64)
-	defer unsubscribe()
+	conn.SetReadLimit(s.maxBody)
+	state := &webSocketState{conn: conn}
+	if !s.trackWebSocket(state) {
+		return
+	}
 
 	done := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			_ = conn.Close()
+		})
+	}
+
 	var writeMu sync.Mutex
 	write := func(payload []byte) error {
 		writeMu.Lock()
@@ -194,43 +309,204 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 		return conn.WriteMessage(websocket.TextMessage, payload)
 	}
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case n, ok := <-notifications:
-				if !ok {
+
+	var writerWG sync.WaitGroup
+	unsubscribe := func() {}
+	notificationsStarted := false
+	startNotifications := func() {
+		if notificationsStarted {
+			return
+		}
+		notificationsStarted = true
+		notifications, stopNotifications := s.engine.Subscribe(64)
+		unsubscribe = stopNotifications
+		writerWG.Add(1)
+		go func() {
+			defer writerWG.Done()
+			for {
+				select {
+				case <-done:
 					return
-				}
-				payload, _ := json.Marshal(map[string]any{
-					"jsonrpc": "2.0",
-					"method":  n.Method,
-					"params":  []map[string]string{{"gid": n.GID}},
-				})
-				if err := write(payload); err != nil {
-					return
+				case n, ok := <-notifications:
+					if !ok {
+						return
+					}
+					payload, _ := json.Marshal(map[string]any{
+						"jsonrpc": "2.0",
+						"method":  n.Method,
+						"params":  []map[string]string{{"gid": n.GID}},
+					})
+					if err := write(payload); err != nil {
+						stop()
+						return
+					}
 				}
 			}
-		}
+		}()
+	}
+	authenticated := s.rpc.secret == ""
+	if authenticated {
+		startNotifications()
+	} else if err := conn.SetReadDeadline(time.Now().Add(webSocketAuthTimeout)); err != nil {
+		return
+	}
+	defer func() {
+		stop()
+		unsubscribe()
+		writerWG.Wait()
+		s.untrackWebSocket(state)
 	}()
 
 	for {
 		typ, msg, err := conn.ReadMessage()
 		if err != nil {
-			close(done)
 			return
 		}
 		if typ != websocket.TextMessage {
 			continue
 		}
-		response, ok := s.rpc.HandlePayload(msg)
-		if ok {
-			if err := write(response); err != nil {
-				close(done)
+		if !authenticated && s.rpc.payloadProvesSecret(msg) {
+			authenticated = true
+			if err := conn.SetReadDeadline(time.Time{}); err != nil {
 				return
 			}
+			// Subscribe before invoking the authenticated call so notifications
+			// caused by that call cannot race ahead of registration.
+			startNotifications()
 		}
+		if !state.beginRPC() {
+			return
+		}
+		response, ok := s.rpc.HandlePayload(msg)
+		var writeErr error
+		if ok {
+			writeErr = write(response)
+		}
+		closing := state.endRPC()
+		if writeErr != nil || closing {
+			return
+		}
+	}
+}
+
+func (s *Server) beginWebSocket() bool {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.wsClosing || s.wsActive >= maxWebSocketConnections {
+		return false
+	}
+	s.wsActive++
+	s.wsWG.Add(1)
+	return true
+}
+
+func (s *Server) endWebSocket() {
+	s.wsMu.Lock()
+	s.wsActive--
+	s.wsMu.Unlock()
+	s.wsWG.Done()
+}
+
+func (s *Server) trackWebSocket(state *webSocketState) bool {
+	s.wsMu.Lock()
+	if s.wsClosing {
+		s.wsMu.Unlock()
+		_ = state.conn.Close()
+		return false
+	}
+	s.wsConns[state.conn] = state
+	s.wsMu.Unlock()
+	return true
+}
+
+func (s *Server) untrackWebSocket(state *webSocketState) {
+	s.wsMu.Lock()
+	delete(s.wsConns, state.conn)
+	s.wsMu.Unlock()
+}
+
+func (state *webSocketState) beginRPC() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closing {
+		return false
+	}
+	state.handling = true
+	return true
+}
+
+func (state *webSocketState) endRPC() bool {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.handling = false
+	if state.closing {
+		_ = state.conn.Close()
+		return true
+	}
+	return false
+}
+
+// Close stops accepting WebSocket connections through this Server's handlers,
+// closes tracked connections, and waits for their subscriptions to be released.
+// It intentionally does not close an externally owned http.Server.
+func (s *Server) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.initiateWebSocketClose()
+	if err := s.waitWebSockets(ctx); err != nil {
+		s.forceCloseWebSockets()
+		return err
+	}
+	return nil
+}
+
+func (s *Server) initiateWebSocketClose() {
+	s.wsMu.Lock()
+	if s.wsClosing {
+		s.wsMu.Unlock()
+		return
+	}
+	s.wsClosing = true
+	states := make([]*webSocketState, 0, len(s.wsConns))
+	for _, state := range s.wsConns {
+		states = append(states, state)
+	}
+	s.wsMu.Unlock()
+	for _, state := range states {
+		state.mu.Lock()
+		state.closing = true
+		handling := state.handling
+		state.mu.Unlock()
+		if !handling {
+			_ = state.conn.Close()
+		}
+	}
+}
+
+func (s *Server) waitWebSockets(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wsWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) forceCloseWebSockets() {
+	s.wsMu.Lock()
+	conns := make([]*websocket.Conn, 0, len(s.wsConns))
+	for conn := range s.wsConns {
+		conns = append(conns, conn)
+	}
+	s.wsMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 }
 
@@ -292,7 +568,36 @@ func sameWebSocketOrigin(r *http.Request) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	expectedScheme := "http"
+	if r.TLS != nil {
+		expectedScheme = "https"
+	}
+	if !strings.EqualFold(u.Scheme, expectedScheme) {
+		return false
+	}
+	originHost, ok := canonicalOriginHost(u.Host, expectedScheme)
+	if !ok {
+		return false
+	}
+	requestHost, ok := canonicalOriginHost(r.Host, expectedScheme)
+	return ok && strings.EqualFold(originHost, requestHost)
+}
+
+func canonicalOriginHost(rawHost, scheme string) (string, bool) {
+	u := &url.URL{Host: rawHost}
+	host := u.Hostname()
+	if host == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(strings.ToLower(host), port), true
 }
 
 func validJSONPCallback(callback string) bool {
@@ -321,4 +626,27 @@ func validJSIdentifier(s string) bool {
 		return false
 	}
 	return true
+}
+
+func requestQueryLimit(maxBody int64) int64 {
+	// A JSON GET payload can expand through base64 and URL escaping. Bound the
+	// wire representation independently while keeping every configured decoded
+	// payload size reachable.
+	const overhead = int64(64 << 10)
+	if maxBody > (int64(^uint64(0)>>1)-overhead)/4 {
+		return int64(^uint64(0) >> 1)
+	}
+	return maxBody*4 + overhead
+}
+
+func requestHeaderLimit(maxBody int64) int {
+	limit := requestQueryLimit(maxBody)
+	maxInt := int64(^uint(0) >> 1)
+	if limit > maxInt {
+		return int(maxInt)
+	}
+	if limit < 1<<20 {
+		return 1 << 20
+	}
+	return int(limit)
 }

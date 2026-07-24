@@ -49,7 +49,9 @@ gid, err := engine.AddURI([]string{"https://example.com/file.bin"}, goaria.Optio
 }, nil)
 ```
 
-Torrent downloads can be processed file-by-file by setting `Config.TorrentFileHandler`. The handler receives a `TorrentFileLease` for each selected torrent file as soon as that file is complete, while the rest of the torrent can continue downloading. Handlers for different files can run concurrently. If the handler returns nil, it must eventually call `TorrentFileLease.Release(ctx)` or `TorrentFileLease.Discard(ctx)`; goaria keeps the torrent download active until the lease is finalized. If the handler returns an error before finalizing the lease, goaria releases the file storage and reports the handler error as the download error. Set the goaria extension option `goaria-torrent-max-active-files` to keep only that many files downloading or leased at a time.
+Torrent downloads can be processed file-by-file by setting `Config.TorrentFileHandler`. The handler receives a `TorrentFile` for each selected torrent file as soon as that file is complete, while the rest of the torrent can continue downloading. Handlers for different files can run concurrently. If the handler returns nil, it must eventually call `file.Lease.Release(ctx)` or `file.Lease.Discard(ctx)`; goaria keeps the torrent download active until the lease is finalized. If the handler returns an error before finalizing the lease, goaria releases the file storage and reports the handler error as the download error. Set the goaria extension option `goaria-torrent-max-active-files` to keep only that many files downloading or leased at a time.
+
+Daemon requests default to a 2 MiB limit. Use `-rpc-max-request-size` to change the HTTP GET, HTTP POST, and WebSocket request limit.
 
 To expose JSON-RPC, import the optional adapter package:
 
@@ -134,7 +136,7 @@ Implemented BitTorrent behaviors include:
 - output path overrides through `index-out`
 - qBittorrent-like peer-visible identity by default for tracker user-agent, BEP20 peer ID prefix, and extended handshake version
 - `aria2.getFiles`, `aria2.getPeers`, `aria2.tellStatus`, and `aria2.getVersion` BitTorrent fields
-- embedded streaming with `Config.TorrentFileHandler`, explicit `TorrentFileLease.Release`/`Discard`, and completed file removal
+- embedded streaming with `Config.TorrentFileHandler`, explicit `TorrentFile.Lease.Release`/`Discard`, and completed file removal
 - test-only direct peer injection through the goaria extension option `goaria-peer-addrs`
 
 ## HTTP Download Coverage

@@ -84,6 +84,211 @@ func TestRPCMalformedSinglePayloadReturnsParseError(t *testing.T) {
 	if resp.Error == nil || resp.Error.Code != rpcInvalidRequest {
 		t.Fatalf("empty object returned %#v, want invalid request", resp)
 	}
+	data, ok := rpc.HandlePayload([]byte(" \n\t"))
+	if !ok {
+		t.Fatal("empty malformed payload returned no response")
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil || resp.Error.Code != rpcParseError {
+		t.Fatalf("empty payload response = %#v, want parse error", resp)
+	}
+}
+
+func TestRPCRejectsInvalidParametersWithoutMutation(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddURI([]string{"http://example.invalid/file"}, goaria.Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpc := NewHandler(engine, "")
+
+	removeWithExtra := `{"jsonrpc":"2.0","id":"remove","method":"aria2.remove","params":["` + gid + `","extra"]}`
+	resp := invokeRPC(t, rpc, removeWithExtra)
+	if resp.Error == nil || resp.Error.Code != rpcInvalidParams {
+		t.Fatalf("extra remove parameter response = %#v, want invalid params", resp)
+	}
+	status, err := engine.TellStatus(gid, []string{"status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["status"] != string(goaria.StatusPaused) {
+		t.Fatalf("rejected remove mutated status to %v", status["status"])
+	}
+
+	for name, payload := range map[string]string{
+		"no-arg method with argument":   `{"jsonrpc":"2.0","id":"version","method":"aria2.getVersion","params":["unexpected"]}`,
+		"null params":                   `{"jsonrpc":"2.0","id":"null","method":"aria2.getVersion","params":null}`,
+		"null string":                   `{"jsonrpc":"2.0","id":"null-string","method":"aria2.remove","params":[null]}`,
+		"null integer":                  `{"jsonrpc":"2.0","id":"null-int","method":"aria2.tellWaiting","params":[null,1]}`,
+		"empty required URI list":       `{"jsonrpc":"2.0","id":"empty-uris","method":"aria2.addUri","params":[[]]}`,
+		"nested option value":           `{"jsonrpc":"2.0","id":"option","method":"aria2.changeOption","params":["` + gid + `",{"header":{"nested":true}}]}`,
+		"null URI list":                 `{"jsonrpc":"2.0","id":"uri","method":"aria2.changeUri","params":["` + gid + `",1,null,[]]}`,
+		"addTorrent trailing parameter": `{"jsonrpc":"2.0","id":"torrent","method":"aria2.addTorrent","params":["unused",{},0,"extra"]}`,
+		"null multicall list":           `{"jsonrpc":"2.0","id":"multi-null","method":"system.multicall","params":[null]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			resp := invokeRPC(t, rpc, payload)
+			if resp.Error == nil || resp.Error.Code != rpcInvalidParams {
+				t.Fatalf("response = %#v, want invalid params", resp)
+			}
+		})
+	}
+
+	resp = invokeRPC(t, rpc, `{"jsonrpc":"2.0","id":{"bad":true},"method":"system.listMethods"}`)
+	if resp.Error == nil || resp.Error.Code != rpcInvalidRequest || resp.ID != nil {
+		t.Fatalf("object request id response = %#v, want invalid request with null id", resp)
+	}
+}
+
+func TestRPCBoundsBatchAndRejectsRecursiveMulticall(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	rpc := NewHandler(engine, "")
+
+	calls := make([]map[string]any, maxBatchCalls+1)
+	for i := range calls {
+		calls[i] = map[string]any{"jsonrpc": "2.0", "id": i, "method": "system.listMethods"}
+	}
+	payload, err := json.Marshal(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ok := rpc.HandlePayload(payload)
+	if !ok {
+		t.Fatal("oversized batch returned no response")
+	}
+	var batchResp rpcResponse
+	if err := json.Unmarshal(data, &batchResp); err != nil {
+		t.Fatal(err)
+	}
+	if batchResp.Error == nil || batchResp.Error.Code != rpcInvalidRequest {
+		t.Fatalf("oversized batch response = %#v, want invalid request", batchResp)
+	}
+
+	resp := invokeRPC(t, rpc, `{"jsonrpc":"2.0","id":"multi","method":"system.multicall","params":[[{"methodName":"system.multicall","params":[[]]},{"methodName":"system.listMethods","params":[]}]]}`)
+	if resp.Error != nil {
+		t.Fatalf("multicall returned top-level error: %#v", resp.Error)
+	}
+	results, ok := resp.Result.([]any)
+	if !ok || len(results) != 2 {
+		t.Fatalf("multicall result = %#v", resp.Result)
+	}
+	fault, ok := results[0].(map[string]any)
+	if !ok || fault["faultCode"] != float64(rpcInvalidParams) {
+		t.Fatalf("recursive multicall result = %#v, want invalid params fault", results[0])
+	}
+}
+
+func TestRPCBoundsOptionArraysAndSuppressesInvalidNotificationResponses(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	rpc := NewHandler(engine, "")
+	values := make([]string, maxStringListItems+1)
+	for i := range values {
+		values[i] = "x"
+	}
+	payload, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      "options",
+		"method":  "aria2.changeGlobalOption",
+		"params":  []any{map[string]any{"header": values}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ok := rpc.HandlePayload(payload)
+	if !ok {
+		t.Fatal("oversized option array returned no response")
+	}
+	var resp rpcResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == nil || resp.Error.Code != rpcInvalidParams {
+		t.Fatalf("oversized option response = %#v, want invalid params", resp)
+	}
+
+	if data, ok := rpc.HandlePayload([]byte(`{"jsonrpc":"2.0","method":"aria2.remove","params":{}}`)); ok || data != nil {
+		t.Fatalf("invalid-params notification produced response %s", data)
+	}
+}
+
+func TestRPCResponseAlwaysContainsExactlyOneOutcome(t *testing.T) {
+	encoded, err := json.Marshal(rpcResponse{JSONRPC: "2.0", Result: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := value["result"]; !ok {
+		t.Fatalf("successful nil result omitted result member: %s", encoded)
+	}
+	if _, ok := value["error"]; ok {
+		t.Fatalf("successful response also contained error: %s", encoded)
+	}
+}
+
+func TestServerEnforcesMaxRequestSizeAcrossHTTPTransports(t *testing.T) {
+	engine, err := goaria.NewEngine(goaria.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	const maxRequestSize = 128
+	server := httptest.NewServer(NewServer(engine, Config{MaxRequestSize: maxRequestSize}).Handler())
+	defer server.Close()
+
+	payload := `{"jsonrpc":"2.0","id":"large","method":"system.listMethods","padding":"` + strings.Repeat("x", 512) + `"}`
+	tests := []struct {
+		name string
+		do   func() (*http.Response, error)
+	}{
+		{
+			name: "POST",
+			do: func() (*http.Response, error) {
+				return http.Post(server.URL+DefaultPath, "application/json", strings.NewReader(payload))
+			},
+		},
+		{
+			name: "raw GET",
+			do: func() (*http.Response, error) {
+				return http.Get(server.URL + DefaultPath + "?params=" + url.QueryEscape(payload))
+			},
+		},
+		{
+			name: "base64 GET",
+			do: func() (*http.Response, error) {
+				encoded := base64.StdEncoding.EncodeToString([]byte(payload))
+				return http.Get(server.URL + DefaultPath + "?params=" + url.QueryEscape(encoded))
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, err := tt.do()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %s, want 413", resp.Status)
+			}
+		})
+	}
 }
 
 func TestRPCPostGetBatchAndMulticall(t *testing.T) {
@@ -546,6 +751,15 @@ func TestJSONPCallbackValidation(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid JSONP callback got %s", resp.Status)
 	}
+
+	resp, err = http.Get(server.URL + "/jsonrpc?method=system.listMethods&id=cb&jsoncallback=" + strings.Repeat("a", maxJSONPCallbackSize+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized JSONP callback got %s", resp.Status)
+	}
 }
 
 func TestInvalidJSONPCallbackRejectedBeforeRPCDispatch(t *testing.T) {
@@ -656,6 +870,18 @@ func TestWebSocketRejectsCrossOriginWithoutSecret(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("cross-origin websocket status = %s, want 403", resp.Status)
 		}
+	}
+}
+
+func TestWebSocketOriginRequiresMatchingSchemeAndCanonicalPort(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/jsonrpc", nil)
+	request.Header.Set("Origin", "https://example.test")
+	if sameWebSocketOrigin(request) {
+		t.Fatal("cross-scheme WebSocket origin was accepted")
+	}
+	request.Header.Set("Origin", "http://example.test:80")
+	if !sameWebSocketOrigin(request) {
+		t.Fatal("equivalent default-port WebSocket origin was rejected")
 	}
 }
 

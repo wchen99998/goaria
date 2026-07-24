@@ -167,26 +167,24 @@ func FuzzTorrentOptionsSelectionAndPaths(f *testing.F) {
 		f.Fatal(err)
 	}
 	for _, seed := range []struct {
-		selectSpec   string
-		indexOut     string
-		trackerCSV   string
-		path         string
-		remotePieces int
-		numPieces    int64
+		selectSpec string
+		indexOut   string
+		trackerCSV string
+		path       string
 	}{
-		{"1", "1=alpha.txt", "udp://one,http://two", "../escape/file.txt", 1, 1},
-		{"1-2", "2=nested/beta.txt", "*", "nested/../beta.txt", 3, 10},
-		{"bad,999", "999=missing.txt", " , ", "", -1, -1},
-		{"", "missing-separator", "http://tracker/announce", "/absolute/path", 99, 10},
+		{"1", "1=alpha.txt", "udp://one,http://two", "../escape/file.txt"},
+		{"1-2", "2=nested/beta.txt", "*", "nested/../beta.txt"},
+		{"bad,999", "999=missing.txt", " , ", ""},
+		{"", "missing-separator", "http://tracker/announce", "/absolute/path"},
 	} {
-		f.Add(seed.selectSpec, seed.indexOut, seed.trackerCSV, seed.path, seed.remotePieces, seed.numPieces)
+		f.Add(seed.selectSpec, seed.indexOut, seed.trackerCSV, seed.path)
 	}
 
-	f.Fuzz(func(t *testing.T, selectSpec, indexOut, trackerCSV, path string, remotePieces int, numPieces int64) {
+	f.Fuzz(func(t *testing.T, selectSpec, indexOut, trackerCSV, path string) {
 		if len(selectSpec) > 512 || len(indexOut) > 1024 || len(trackerCSV) > 2048 || len(path) > 1024 {
 			t.Skip()
 		}
-		_ = selectedFileSet(16, selectSpec)
+		_, _ = selectedFileSet(16, selectSpec)
 		opts := Options{
 			"select-file":        selectSpec,
 			"index-out":          indexOut,
@@ -200,10 +198,6 @@ func FuzzTorrentOptionsSelectionAndPaths(f *testing.F) {
 		}
 		spec := &torrent.TorrentSpec{Trackers: [][]string{{"udp://one"}, {"http://two"}}}
 		applyTorrentTrackerOptions(spec, opts)
-		got := peerBitfield(remotePieces, numPieces)
-		if len(got)%2 != 0 {
-			t.Fatalf("peer bitfield has odd hex length: %q", got)
-		}
 	})
 }
 

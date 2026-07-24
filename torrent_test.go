@@ -24,7 +24,84 @@ import (
 	"github.com/wchen99998/torrent/bencode"
 	"github.com/wchen99998/torrent/metainfo"
 	"github.com/wchen99998/torrent/storage"
+	infohash_v2 "github.com/wchen99998/torrent/types/infohash-v2"
 )
+
+func encodeMetaInfo(mi metainfo.MetaInfo) (string, error) {
+	var buf bytes.Buffer
+	if err := bencode.NewEncoder(&buf).Encode(mi); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+type recordingTorrentStorage struct {
+	opened bool
+}
+
+func (s *recordingTorrentStorage) OpenTorrent(context.Context, *metainfo.Info, metainfo.Hash) (storage.TorrentImpl, error) {
+	s.opened = true
+	return storage.TorrentImpl{}, nil
+}
+
+func TestValidatingTorrentStorageRejectsMetadataBeforeDelegating(t *testing.T) {
+	delegate := &recordingTorrentStorage{}
+	wrapped := validatingTorrentStorage{delegate: delegate}
+	invalid := &metainfo.Info{
+		Name:        "unsafe",
+		Length:      1,
+		PieceLength: maxTorrentProtocolPieceLength + 1,
+		Pieces:      make([]byte, metainfo.HashSize),
+	}
+	if _, err := wrapped.OpenTorrent(context.Background(), invalid, metainfo.Hash{}); err == nil {
+		t.Fatal("unsafe metadata reached torrent storage")
+	}
+	if delegate.opened {
+		t.Fatal("delegate storage opened before metadata validation")
+	}
+
+	valid := &metainfo.Info{Name: "empty"}
+	if _, err := wrapped.OpenTorrent(context.Background(), valid, metainfo.Hash{}); err != nil {
+		t.Fatalf("valid metadata rejected: %v", err)
+	}
+	if !delegate.opened {
+		t.Fatal("valid metadata was not delegated")
+	}
+}
+
+func TestTorrentFileStatesRejectSymlinkEscape(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "outside.bin")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "payload.bin")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	info := metainfo.Info{Name: "payload.bin"}
+	if _, err := torrentFileStates(info, metainfo.Hash{}, nil, dir); err == nil {
+		t.Fatal("torrent output symlink escaped the download directory")
+	}
+}
+
+func TestFetchTorrentURLDoesNotSleepAfterFinalAttempt(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("temporary network failure")
+	})}
+	engine := &Engine{client: client}
+	started := time.Now()
+	_, err := engine.fetchTorrentURL(context.Background(), "http://example.invalid/file.torrent", Options{
+		"max-tries":  "1",
+		"retry-wait": "1",
+	})
+	if err == nil {
+		t.Fatal("fetchTorrentURL unexpectedly succeeded")
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("single final attempt slept for retry-wait: %v", elapsed)
+	}
+}
 
 func TestAddTorrentParsesRealTestTorrent(t *testing.T) {
 	data, err := os.ReadFile("test.torrent")
@@ -61,6 +138,488 @@ func TestAddTorrentParsesRealTestTorrent(t *testing.T) {
 	}
 	if status["totalLength"] == "0" || status["pieceLength"] == "0" || status["numPieces"] == "0" {
 		t.Fatalf("incomplete torrent metadata: %#v", status)
+	}
+}
+
+func TestAddTorrentRejectsMalformedV2InfoBeforeLayout(t *testing.T) {
+	shortRoot := append([]byte("d9:file treed1:ad0:d6:lengthi1e11:pieces root5:shorteee6:lengthi1e12:meta versioni2e4:name1:x12:piece lengthi16384e6:pieces20:"), make([]byte, metainfo.HashSize)...)
+	shortRoot = append(shortRoot, 'e')
+	zeroPieceLength := append([]byte("d9:file treed1:ad0:d6:lengthi1e11:pieces root32:"), make([]byte, 32)...)
+	zeroPieceLength = append(zeroPieceLength, []byte("eee6:lengthi1e12:meta versioni2e4:name1:x12:piece lengthi0e6:pieces20:")...)
+	zeroPieceLength = append(zeroPieceLength, make([]byte, metainfo.HashSize)...)
+	zeroPieceLength = append(zeroPieceLength, 'e')
+
+	for name, info := range map[string][]byte{
+		"short pieces root": shortRoot,
+		"zero piece length": zeroPieceLength,
+	} {
+		t.Run(name, func(t *testing.T) {
+			meta := append([]byte("d4:info"), info...)
+			meta = append(meta, 'e')
+			engine, err := NewEngine(Config{Dir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close(context.Background())
+
+			if _, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(meta), nil, Options{"pause": "true"}, nil); err == nil {
+				t.Fatal("AddTorrent accepted malformed v2 metainfo")
+			}
+			if got := len(engine.downloadsSnapshot()); got != 0 {
+				t.Fatalf("malformed torrent registered %d downloads", got)
+			}
+		})
+	}
+}
+
+func TestTorrentMetadataValidationBoundsV2Geometry(t *testing.T) {
+	root := string(bytes.Repeat([]byte{0x51}, 32))
+	fileTree := func(length int64) metainfo.FileTree {
+		return metainfo.FileTree{Dir: map[string]metainfo.FileTree{
+			"payload.bin": {File: metainfo.FileTreeFile{Length: length, PiecesRoot: root}},
+		}}
+	}
+	for name, tc := range map[string]struct {
+		info    metainfo.Info
+		wantErr string
+	}{
+		"piece length exceeds protocol integer": {
+			info: metainfo.Info{
+				MetaVersion: 2,
+				PieceLength: 1 << 32,
+				Name:        "oversized-piece",
+				FileTree:    fileTree(1),
+			},
+			wantErr: "exceeds peer protocol limit",
+		},
+		"piece count exceeds allocation bound": {
+			info: metainfo.Info{
+				MetaVersion: 2,
+				PieceLength: 16 << 10,
+				Name:        "too-many-pieces",
+				FileTree:    fileTree((maxTorrentPieceCount + 1) * (16 << 10)),
+			},
+			wantErr: "more than 1048576 pieces",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateTorrentInfo(&tc.info); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validateTorrentInfo error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	safeLargePiece := metainfo.Info{
+		MetaVersion: 2,
+		PieceLength: 128 << 20,
+		Name:        "bounded-large-piece",
+		FileTree:    fileTree(1),
+	}
+	if err := validateTorrentInfo(&safeLargePiece); err != nil {
+		t.Fatalf("largest safe v2 piece length rejected: %v", err)
+	}
+}
+
+func TestTorrentMetadataValidationChecksHybridLayout(t *testing.T) {
+	const pieceLength = int64(16 << 10)
+	root := string(bytes.Repeat([]byte{0x63}, 32))
+	valid := metainfo.Info{
+		MetaVersion: 2,
+		PieceLength: pieceLength,
+		Name:        "hybrid",
+		Pieces:      make([]byte, 2*metainfo.HashSize),
+		Files: []metainfo.FileInfo{
+			{Length: 1, Path: []string{"a.bin"}},
+			{
+				Length:            pieceLength - 1,
+				Path:              []string{".pad", strconv.FormatInt(pieceLength-1, 10)},
+				ExtendedFileAttrs: metainfo.ExtendedFileAttrs{Attr: "p"},
+			},
+			{Length: 1, Path: []string{"b.bin"}},
+		},
+		FileTree: metainfo.FileTree{Dir: map[string]metainfo.FileTree{
+			"a.bin": {File: metainfo.FileTreeFile{Length: 1, PiecesRoot: root}},
+			"b.bin": {File: metainfo.FileTreeFile{Length: 1, PiecesRoot: root}},
+		}},
+	}
+	if err := validateTorrentInfo(&valid); err != nil {
+		t.Fatalf("valid aligned hybrid rejected: %v", err)
+	}
+
+	badPath := valid
+	badPath.Files = append([]metainfo.FileInfo(nil), valid.Files...)
+	badPath.Files[0].Path = []string{"different.bin"}
+	if err := validateTorrentInfo(&badPath); err == nil || !strings.Contains(err.Error(), "paths differ") {
+		t.Fatalf("hybrid path mismatch error = %v", err)
+	}
+
+	badOffset := valid
+	badOffset.Files = append([]metainfo.FileInfo(nil), valid.Files...)
+	badOffset.Files[1].Length++
+	if err := validateTorrentInfo(&badOffset); err == nil || !strings.Contains(err.Error(), "offsets differ") {
+		t.Fatalf("hybrid offset mismatch error = %v", err)
+	}
+
+	badPieceCount := valid
+	badPieceCount.Pieces = badPieceCount.Pieces[:metainfo.HashSize]
+	if err := validateTorrentInfo(&badPieceCount); err == nil || !strings.Contains(err.Error(), "piece count") {
+		t.Fatalf("hybrid piece-count mismatch error = %v", err)
+	}
+}
+
+func TestTorrentPieceLayerValidationRejectsUnexpectedHashCount(t *testing.T) {
+	const pieceLength = int64(16 << 10)
+	root := string(bytes.Repeat([]byte{0x72}, 32))
+	info := metainfo.Info{
+		MetaVersion: 2,
+		PieceLength: pieceLength,
+		Name:        "piece-layer-shape",
+		FileTree: metainfo.FileTree{Dir: map[string]metainfo.FileTree{
+			"payload.bin": {File: metainfo.FileTreeFile{Length: 2*pieceLength + 1, PiecesRoot: root}},
+		}},
+	}
+	if err := validateTorrentInfo(&info); err != nil {
+		t.Fatal(err)
+	}
+	layers := map[string]string{root: string(make([]byte, 4*32))}
+	if err := validateTorrentPieceLayers(layers, &info); err == nil || !strings.Contains(err.Error(), "128 bytes, expected 96") {
+		t.Fatalf("piece-layer shape error = %v", err)
+	}
+}
+
+func TestTorrentPiecePadHashMatchesFork(t *testing.T) {
+	for pieceLength := int64(16 << 10); pieceLength <= 2<<30; pieceLength <<= 1 {
+		if got, want := torrentPiecePadHash(pieceLength), metainfo.HashForPiecePad(pieceLength); got != want {
+			t.Fatalf("piece pad hash for %d bytes = %x, want %x", pieceLength, got, want)
+		}
+	}
+}
+
+func TestPausedSelectedTorrentBitfieldUsesWholeTorrentWidth(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, info, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.UpvertedFiles()) < 2 {
+		t.Fatal("test torrent needs at least two files")
+	}
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+		"pause":       "true",
+		"select-file": "2",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBitfield := unknownTorrentBitfield(int64(info.NumPieces()))
+	assertStatus := func(label string) {
+		t.Helper()
+		status, err := engine.TellStatus(gid, []string{"numPieces", "bitfield"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status["numPieces"] != strconv.Itoa(info.NumPieces()) || status["bitfield"] != wantBitfield {
+			t.Fatalf("%s status = %#v, want whole-torrent zero bitfield %q", label, status, wantBitfield)
+		}
+		engine.mu.RLock()
+		download := engine.downloads[gid]
+		engine.mu.RUnlock()
+		download.mu.RLock()
+		donePieces := download.donePieces
+		download.mu.RUnlock()
+		if donePieces != 0 {
+			t.Fatalf("%s donePieces = %d, want 0 without verified runtime state", label, donePieces)
+		}
+	}
+	assertStatus("paused selection")
+
+	engine.mu.RLock()
+	download := engine.downloads[gid]
+	engine.mu.RUnlock()
+	if err := download.restoreTorrentFinalized(map[int]struct{}{2: {}}); err != nil {
+		t.Fatal(err)
+	}
+	assertStatus("restored finalized selection")
+	if _, err := engine.ChangeOption(gid, Options{"select-file": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	assertStatus("changed selection")
+}
+
+func TestV2OnlyTorrentUsesCanonicalShortInfoHash(t *testing.T) {
+	mi, info, data := v2OnlyTestMetaInfo(t)
+	v2Hash := infohash_v2.HashBytes(mi.InfoBytes)
+	want := v2Hash.ToShort().HexString()
+	if want == mi.HashInfoBytes().HexString() {
+		t.Fatal("v2 fixture does not distinguish canonical and v1-style hashes")
+	}
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	directGID, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directStatus, err := engine.TellStatus(directGID, []string{"infoHash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directStatus["infoHash"] != want {
+		t.Fatalf("v2 torrent infoHash = %v, want canonical short hash %s", directStatus["infoHash"], want)
+	}
+
+	magnet := fmt.Sprintf("magnet:?xt=urn:btmh:1220%s&dn=v2-only", v2Hash.HexString())
+	magnetGID, err := engine.AddURI([]string{magnet}, Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	magnetStatus, err := engine.TellStatus(magnetGID, []string{"infoHash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if magnetStatus["infoHash"] != want {
+		t.Fatalf("v2 magnet infoHash = %v, want canonical short hash %s", magnetStatus["infoHash"], want)
+	}
+
+	engine.mu.RLock()
+	magnetDownload := engine.downloads[magnetGID]
+	engine.mu.RUnlock()
+	cfg := torrent.NewDefaultClientConfig()
+	cfg.DataDir = t.TempDir()
+	cfg.ListenHost = torrent.LoopbackListenHost
+	cfg.ListenPort = 0
+	cfg.NoDHT = true
+	cfg.DisableTrackers = true
+	cfg.DisableUTP = true
+	cfg.NoUpload = true
+	cfg.NoDefaultPortForwarding = true
+	cfg.Slogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	client, err := torrent.NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	spec, err := torrent.TorrentSpecFromMetaInfo(mi)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ensureTorrentSpecShortInfoHash(spec)
+	tor, _, err := client.AddTorrentSpec(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-tor.GotInfo()
+	if err := engine.refreshTorrentMetadata(magnetDownload, tor); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := engine.TellStatus(magnetGID, []string{"infoHash", "numPieces", "bitfield"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed["infoHash"] != want {
+		t.Fatalf("refreshed v2 magnet infoHash = %v, want stable hash %s", refreshed["infoHash"], want)
+	}
+	if refreshed["numPieces"] != strconv.Itoa(info.NumPieces()) {
+		t.Fatalf("refreshed v2 numPieces = %v, want %d", refreshed["numPieces"], info.NumPieces())
+	}
+
+	hybrid := info
+	hybrid.Pieces = make([]byte, metainfo.HashSize)
+	hybridBytes, err := bencode.Marshal(&hybrid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hybridMI := &metainfo.MetaInfo{InfoBytes: hybridBytes}
+	if got := canonicalTorrentMetaInfoHash(hybridMI, hybrid); got != hybridMI.HashInfoBytes() {
+		t.Fatalf("hybrid canonical hash = %s, want v1 hash %s", got, hybridMI.HashInfoBytes())
+	}
+}
+
+func TestMagnetMetadataRefreshAllowsDeferredV2PieceLayers(t *testing.T) {
+	const pieceLength = int64(16 << 10)
+	info := metainfo.Info{
+		MetaVersion: 2,
+		PieceLength: pieceLength,
+		Name:        "deferred-layers",
+		FileTree: metainfo.FileTree{Dir: map[string]metainfo.FileTree{
+			"payload.bin": {File: metainfo.FileTreeFile{
+				Length:     2*pieceLength + 1,
+				PiecesRoot: string(bytes.Repeat([]byte{0x73}, 32)),
+			}},
+		}},
+	}
+	infoBytes, err := bencode.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi := &metainfo.MetaInfo{InfoBytes: infoBytes}
+	if err := validateRefreshedTorrentMetadata(*mi, &info, true); err != nil {
+		t.Fatalf("magnet metadata without immediate piece layers was rejected: %v", err)
+	}
+	if err := validateRefreshedTorrentMetadata(*mi, &info, false); err == nil || !strings.Contains(err.Error(), "piece layers") {
+		t.Fatalf("direct v2 metadata without piece layers error = %v, want piece-layer rejection", err)
+	}
+
+	var encoded bytes.Buffer
+	if err := bencode.NewEncoder(&encoded).Encode(mi); err != nil {
+		t.Fatal(err)
+	}
+	d := &Download{torrentMagnet: "magnet:?xt=urn:btmh:1220deferred", torrentData: encoded.Bytes()}
+	d.mu.Lock()
+	cached, err := d.metadataInfoLocked()
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatalf("cached magnet metadata became unusable: %v", err)
+	}
+	if cached == nil || cached.PieceLength != pieceLength {
+		t.Fatalf("cached magnet info = %#v, want piece length %d", cached, pieceLength)
+	}
+}
+
+func TestEmbeddedTorrentWebseedUsesConfiguredHTTPOptions(t *testing.T) {
+	payload := bytes.Repeat([]byte("configured-webseed-"), 2048)
+	requests := make(chan http.Header, 32)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requests <- r.Header.Clone():
+		default:
+		}
+		if r.Header.Get("X-Goaria-Webseed") != "configured" {
+			http.Error(w, "missing configured header", http.StatusUnauthorized)
+			return
+		}
+		http.ServeContent(w, r, "payload.bin", time.Unix(1, 0), bytes.NewReader(payload))
+	}))
+	defer server.Close()
+
+	source := filepath.Join(t.TempDir(), "payload.bin")
+	if err := os.WriteFile(source, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info := metainfo.Info{PieceLength: 16 << 10}
+	if err := info.BuildFromFilePath(source); err != nil {
+		t.Fatal(err)
+	}
+	infoBytes, err := bencode.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi := metainfo.MetaInfo{
+		InfoBytes: infoBytes,
+		UrlList:   []string{server.URL, server.URL},
+	}
+	var encoded bytes.Buffer
+	if err := mi.Write(&encoded); err != nil {
+		t.Fatal(err)
+	}
+
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(encoded.Bytes()), []string{server.URL}, Options{
+		"header":                  []string{"X-Goaria-Webseed: configured"},
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	select {
+	case header := <-requests:
+		if got := header.Get("X-Goaria-Webseed"); got != "configured" {
+			t.Fatalf("embedded webseed header = %q, want configured", got)
+		}
+	default:
+		t.Fatal("embedded webseed was not requested")
+	}
+
+	spec := &torrent.TorrentSpec{Webseeds: []string{"https://one.invalid", "https://two.invalid", "https://one.invalid"}}
+	got, err := extractTorrentWebSeedURLs(spec, []URIInfo{
+		{URI: "https://two.invalid"},
+		{URI: "https://three.invalid"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "https://one.invalid,https://two.invalid,https://three.invalid" {
+		t.Fatalf("combined webseeds = %#v", got)
+	}
+	if spec.Webseeds != nil {
+		t.Fatalf("TorrentSpec retained unconfigured webseeds: %#v", spec.Webseeds)
+	}
+	overLimit := make([]string, maxTorrentWebSeeds+1)
+	for i := range overLimit {
+		overLimit[i] = fmt.Sprintf("https://webseed-%d.invalid", i)
+	}
+	if _, err := mergeTorrentWebSeedURLs(overLimit, nil); err == nil {
+		t.Fatal("accepted an unbounded embedded webseed list")
+	}
+}
+
+func TestTorrentPieceProgressUsesVerifiedPieceRuns(t *testing.T) {
+	complete := torrent.PieceState{Completion: storage.Completion{Ok: true, Complete: true}}
+	incomplete := torrent.PieceState{Completion: storage.Completion{Ok: true}}
+	unknownComplete := torrent.PieceState{Completion: storage.Completion{Complete: true}}
+	runs := torrent.PieceStateRuns{
+		{PieceState: complete, Length: 1},
+		{PieceState: incomplete, Length: 1},
+		{PieceState: complete, Length: 2},
+		{PieceState: unknownComplete, Length: 1},
+		{PieceState: complete, Length: 1},
+		{PieceState: incomplete, Length: 4},
+	}
+	if done, bitfield := torrentPieceProgress(runs); done != 4 || bitfield != "b400" {
+		t.Fatalf("piece progress = (%d, %q), want (4, %q)", done, bitfield, "b400")
+	}
+	if done, bitfield := torrentPieceProgress(torrent.PieceStateRuns{{PieceState: unknownComplete, Length: 2}}); done != 0 || bitfield != "00" {
+		t.Fatalf("unknown piece progress = (%d, %q), want (0, %q)", done, bitfield, "00")
+	}
+	if done, bitfield := torrentPieceProgress(nil); done != 0 || bitfield != "" {
+		t.Fatalf("empty piece progress = (%d, %q), want zero values", done, bitfield)
+	}
+}
+
+func TestTorrentDownloadRateLimitUsesDefaultBoundedBurst(t *testing.T) {
+	cfg := torrent.NewDefaultClientConfig()
+	applyTorrentRateLimitOptions(cfg, Options{"max-download-limit": "2K", "max-upload-limit": "3K"})
+	if cfg.DownloadRateLimiter == nil {
+		t.Fatal("max-download-limit did not configure the torrent client")
+	}
+	if got := int64(cfg.DownloadRateLimiter.Limit()); got != 2<<10 {
+		t.Fatalf("torrent download limit = %d, want %d", got, 2<<10)
+	}
+	if got := cfg.DownloadRateLimiter.Burst(); got != 0 {
+		t.Fatalf("torrent download limiter burst = %d, want zero for fork defaulting", got)
+	}
+	if cfg.UploadRateLimiter == nil || int64(cfg.UploadRateLimiter.Limit()) != 3<<10 || cfg.UploadRateLimiter.Burst() != 0 {
+		t.Fatalf("torrent upload limiter = %#v, want 3K with zero burst", cfg.UploadRateLimiter)
+	}
+}
+
+func TestTorrentOverallDownloadLimitAppliesAsCeiling(t *testing.T) {
+	cfg := torrent.NewDefaultClientConfig()
+	applyTorrentRateLimitOptions(cfg, Options{
+		"max-download-limit":         "8K",
+		"max-overall-download-limit": "2K",
+	})
+	if cfg.DownloadRateLimiter == nil || int64(cfg.DownloadRateLimiter.Limit()) != 2<<10 {
+		t.Fatalf("torrent download limiter = %#v, want overall 2K ceiling", cfg.DownloadRateLimiter)
 	}
 }
 
@@ -190,6 +749,40 @@ func TestAddTorrentFetchesHTTPURLWithWebseedsAndPersistsBytes(t *testing.T) {
 	}
 	if restoredStatus["status"] != string(StatusPaused) || restoredStatus["infoHash"] != wantInfoHash {
 		t.Fatalf("restored status = %#v, want paused torrent %s", restoredStatus, wantInfoHash)
+	}
+}
+
+func TestAddTorrentDirectHonorsMaxTorrentSize(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := NewEngine(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	limit := int64(len(data) - 1)
+	if _, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+		"goaria-max-torrent-size": strconv.FormatInt(limit, 10),
+		"pause":                   "true",
+	}, nil); err == nil {
+		t.Fatal("oversized direct torrent was accepted")
+	} else {
+		var sizeErr *torrentSizeError
+		if !errors.As(err, &sizeErr) || sizeErr.max != limit {
+			t.Fatalf("oversized direct torrent error = %v, want limit %d", err, limit)
+		}
+	}
+	if got := len(engine.downloadsSnapshot()); got != 0 {
+		t.Fatalf("oversized direct torrent registered %d downloads", got)
+	}
+	if _, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
+		"goaria-max-torrent-size": strconv.Itoa(len(data)),
+		"pause":                   "true",
+	}, nil); err != nil {
+		t.Fatalf("torrent at exact configured size rejected: %v", err)
 	}
 }
 
@@ -342,7 +935,6 @@ func TestTorrentCompletesWhenNoFilesAreSelected(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, extra := range map[string]Options{
-		"select-file":         {"select-file": "not-a-number"},
 		"extension selection": {"goaria-select-file-ext": ".missing"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -429,7 +1021,10 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 		}
 	}
 
-	selected := selectedFileSet(5, "2, 4-5, bad, 7-6,")
+	selected, err := selectedFileSet(5, "2,4-5")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, index := range []int{2, 4, 5} {
 		if !selected[index] {
 			t.Fatalf("selectedFileSet missing index %d: %#v", index, selected)
@@ -438,8 +1033,11 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if selected[1] || selected[3] || selected[6] {
 		t.Fatalf("selectedFileSet selected unexpected indexes: %#v", selected)
 	}
-	if all := selectedFileSet(1, "999"); !all[1] || len(all) != 1 {
-		t.Fatalf("single-file selection should select the only file: %#v", all)
+	if _, err := selectedFileSet(1, "999"); err == nil {
+		t.Fatal("out-of-range single-file selection unexpectedly succeeded")
+	}
+	if _, err := selectedFileSet(5, "2,bad"); err == nil {
+		t.Fatal("malformed selection unexpectedly succeeded")
 	}
 
 	extInfo := metainfo.Info{
@@ -515,6 +1113,7 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	}
 	for _, opts := range []Options{
 		{"select-file": "999"},
+		{"select-file": "1-9223372036854775807"},
 		{"index-out": "999=missing.txt"},
 	} {
 		if _, _, err := torrentSelectionAndIndexOut(info, opts); err == nil {
@@ -558,7 +1157,7 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if gotPath != filepath.Join(info.BestName(), "nested", "beta.txt") {
 		t.Fatalf("default path = %q", gotPath)
 	}
-	states, err := torrentFileStates(info, metainfo.Hash{}, Options{"index-out": "2=custom-beta.txt"}, t.TempDir(), nil)
+	states, err := torrentFileStates(info, metainfo.Hash{}, Options{"index-out": "2=custom-beta.txt"}, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,16 +1165,7 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 		t.Fatalf("index-out torrent state path = %q", states[1].Path)
 	}
 
-	if got := peerBitfield(0, 8); got != "" {
-		t.Fatalf("empty peer bitfield = %q", got)
-	}
-	if got := peerBitfield(3, 10); got != "e000" {
-		t.Fatalf("partial peer bitfield = %q, want e000", got)
-	}
-	if got := peerBitfield(99, 10); got != "ffc0" {
-		t.Fatalf("capped peer bitfield = %q, want ffc0", got)
-	}
-	if _, err := newMagnetDownload("gid", "magnet:?xt=urn:btih:not-a-hash", nil); err == nil {
+	if _, err := newMagnetDownload("gid", "magnet:?xt=urn:btih:not-a-hash", nil, nil); err == nil {
 		t.Fatal("newMagnetDownload accepted invalid magnet")
 	}
 	d, err := newTorrentDownload("gid", nil, "", nil, Options{}, nil, metainfo.Info{})
@@ -882,6 +1472,129 @@ func TestTorrentChangeOptionAppliesExtensionSelection(t *testing.T) {
 	}
 }
 
+func TestActiveTorrentSelectionChangeRestartsFixedSelection(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+	firstStarted := make(chan struct{}, 1)
+	secondHandled := make(chan struct{}, 1)
+	releaseCanceledHandler := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCanceled := func() { releaseOnce.Do(func() { close(releaseCanceledHandler) }) }
+	defer releaseCanceled()
+	engine, err := NewEngine(Config{
+		Dir: t.TempDir(),
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			switch tf.Lease.Index {
+			case 0:
+				select {
+				case firstStarted <- struct{}{}:
+				default:
+				}
+				<-ctx.Done()
+				<-releaseCanceledHandler
+				return ctx.Err()
+			case 1:
+				if err := tf.Lease.Release(ctx); err != nil {
+					return err
+				}
+				select {
+				case secondHandled <- struct{}{}:
+				default:
+				}
+				return nil
+			default:
+				return fmt.Errorf("unexpected file index %d", tf.Lease.Index)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+	gid, err := engine.AddTorrent(encoded, nil, Options{
+		"select-file":                     "1",
+		"goaria-peer-addrs":               peerAddrs,
+		"goaria-disable-dht":              "true",
+		"goaria-disable-trackers":         "true",
+		"goaria-disable-utp":              "true",
+		"goaria-torrent-max-active-files": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first selected file did not reach the handler")
+	}
+	before, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ChangeOption(gid, Options{"select-file": "2"}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.reserveOutputPath(before[0].Path, "competing-old", false); err == nil {
+		t.Fatal("old torrent output path was released while its canceled runtime could still write")
+	}
+	if _, err := engine.reserveOutputPath(after[1].Path, "competing-new", false); err == nil {
+		t.Fatal("replacement torrent output path was not reserved before restart")
+	}
+	releaseCanceled()
+	select {
+	case <-secondHandled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement run did not process the newly selected file")
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || files[0].Selected != "false" || files[1].Selected != "true" {
+		t.Fatalf("selection after active restart = %#v", files)
+	}
+}
+
+func TestTorrentChangeOptionIsAtomicOnLayoutError(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	engine, err := NewEngine(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{"pause": "true"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.ChangeOption(gid, Options{
+		"dir":       t.TempDir(),
+		"index-out": "999=missing.txt",
+	}); err == nil {
+		t.Fatal("ChangeOption accepted an out-of-range index-out")
+	}
+
+	opts, err := engine.GetOption(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := opts["dir"]; got != dir {
+		t.Fatalf("dir = %v after failed ChangeOption, want %s", got, dir)
+	}
+	if _, ok := opts["index-out"]; ok {
+		t.Fatalf("failed ChangeOption persisted index-out: %#v", opts)
+	}
+}
+
 func TestChangeOptionActiveMagnetBeforeMetadata(t *testing.T) {
 	engine, err := NewEngine(Config{Dir: t.TempDir()})
 	if err != nil {
@@ -1036,6 +1749,44 @@ func TestTorrentChangeOptionPreservesProgressWhenRebuildingFiles(t *testing.T) {
 	}
 	if status["completedLength"] != strconv.FormatInt(firstCompleted+secondCompleted, 10) {
 		t.Fatalf("completedLength after reselection = %v, want %d", status["completedLength"], firstCompleted+secondCompleted)
+	}
+}
+
+func TestTorrentLayoutChangeKeepsFinalizedFileIdentity(t *testing.T) {
+	data, err := os.ReadFile("test.torrent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi, info, err := torrentMetaInfo(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDir := t.TempDir()
+	oldStates, err := torrentFileStates(info, mi.HashInfoBytes(), Options{}, oldDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(oldStates) < 2 {
+		t.Fatal("torrent fixture needs at least two files")
+	}
+	oldStates[0].Completed = oldStates[0].Length
+	oldStates[1].Completed = min(oldStates[1].Length, 7)
+	finalized := map[int]struct{}{oldStates[0].Index: {}}
+	newDir := t.TempDir()
+	next, _, _, err := rebuildTorrentFileStatesPreservingProgress(info, Options{
+		"index-out": []string{fmt.Sprintf("%d=moved/final.bin", oldStates[0].Index)},
+	}, newDir, oldStates, finalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next[0].Path != oldStates[0].Path || next[0].Completed != next[0].Length {
+		t.Fatalf("finalized file identity changed: old=%#v new=%#v", oldStates[0], next[0])
+	}
+	if next[1].Path == oldStates[1].Path {
+		t.Fatalf("unfinished file did not adopt new layout: old=%#v new=%#v", oldStates[1], next[1])
+	}
+	if next[1].Completed != oldStates[1].Completed {
+		t.Fatalf("unfinished progress = %d, want %d", next[1].Completed, oldStates[1].Completed)
 	}
 }
 
@@ -1260,7 +2011,14 @@ func TestTorrentMetadataOnlyAppliesTrackerOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, engine, gid, StatusComplete)
-	status, err := engine.TellStatus(gid, []string{"bittorrent"})
+	status, err := engine.TellStatus(gid, []string{"completedLength"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["completedLength"] != "0" {
+		t.Fatalf("metadata-only completedLength = %v, want 0", status["completedLength"])
+	}
+	status, err = engine.TellStatus(gid, []string{"bittorrent"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1326,6 +2084,27 @@ func TestTorrentStreamHandlerProcessesAndReleasesFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForStatus(t, engine, gid, StatusComplete)
+	status, err := engine.TellStatus(gid, []string{"numPieces", "bitfield"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	numPieces, err := strconv.Atoi(status["numPieces"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDone, wantBitfield := torrentPieceProgress(torrent.PieceStateRuns{{
+		PieceState: torrent.PieceState{Completion: storage.Completion{Ok: true, Complete: true}},
+		Length:     numPieces,
+	}})
+	engine.mu.RLock()
+	download := engine.downloads[gid]
+	engine.mu.RUnlock()
+	download.mu.RLock()
+	gotDone := download.donePieces
+	download.mu.RUnlock()
+	if gotDone != wantDone || status["bitfield"] != wantBitfield {
+		t.Fatalf("released torrent piece state = done %d bitfield %v, want %d %s", gotDone, status["bitfield"], wantDone, wantBitfield)
+	}
 
 	seenMu.Lock()
 	sort.Strings(seenFiles)
@@ -1357,6 +2136,211 @@ func TestTorrentStreamHandlerProcessesAndReleasesFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(seedDir); err != nil {
 		t.Fatalf("seeder data disappeared: %v", err)
+	}
+}
+
+func TestTorrentStreamFinalizedFilesSurvivePauseUnpause(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+
+	var countsMu sync.Mutex
+	counts := make(map[int]int)
+	started := make(chan int, 4)
+	engine, err := NewEngine(Config{
+		Dir: t.TempDir(),
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			countsMu.Lock()
+			counts[tf.Lease.Index]++
+			invocation := counts[tf.Lease.Index]
+			countsMu.Unlock()
+			if tf.Lease.Index == 0 {
+				if err := tf.Lease.Release(ctx); err != nil {
+					return err
+				}
+				started <- tf.Lease.Index
+				return nil
+			}
+			started <- tf.Lease.Index
+			if invocation == 1 {
+				<-ctx.Done()
+				if err := tf.Lease.Discard(context.Background()); err != nil {
+					return err
+				}
+				return ctx.Err()
+			}
+			return tf.Lease.Release(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	gid, err := engine.AddTorrent(encoded, nil, Options{
+		"goaria-disable-dht":              "true",
+		"goaria-disable-trackers":         "true",
+		"goaria-disable-utp":              "true",
+		"goaria-peer-addrs":               peerAddrs,
+		"goaria-torrent-max-active-files": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveTorrentFileIndex(t, started, "first finalized file"); got != 0 {
+		t.Fatalf("first handled file index = %d, want 0", got)
+	}
+	if got := receiveTorrentFileIndex(t, started, "second file before pause"); got != 1 {
+		t.Fatalf("second handled file index = %d, want 1", got)
+	}
+	if _, err := engine.Pause(gid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Unpause(gid); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveTorrentFileIndex(t, started, "second file after unpause"); got != 1 {
+		t.Fatalf("resumed handled file index = %d, want 1", got)
+	}
+	waitForStatus(t, engine, gid, StatusComplete)
+
+	countsMu.Lock()
+	firstCount, secondCount := counts[0], counts[1]
+	countsMu.Unlock()
+	if firstCount != 1 || secondCount != 2 {
+		t.Fatalf("handler calls by zero-based index = %#v, want map[0:1 1:2]", counts)
+	}
+	files, err := engine.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		if file.CompletedLength != file.Length {
+			t.Fatalf("final file progress = %#v, want completed", file)
+		}
+	}
+}
+
+func TestTorrentStreamFinalizedFilesSurviveSessionRoundTrip(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "goaria.session")
+	started := make(chan int, 2)
+	engine, err := NewEngine(Config{
+		Dir:         dir,
+		SaveSession: sessionPath,
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			if tf.Lease.Index == 0 {
+				if err := tf.Lease.Release(ctx); err != nil {
+					return err
+				}
+				started <- tf.Lease.Index
+				return nil
+			}
+			started <- tf.Lease.Index
+			<-ctx.Done()
+			if err := tf.Lease.Discard(context.Background()); err != nil {
+				return err
+			}
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gid, err := engine.AddTorrent(encoded, nil, Options{
+		"goaria-disable-dht":              "true",
+		"goaria-disable-trackers":         "true",
+		"goaria-disable-utp":              "true",
+		"goaria-peer-addrs":               peerAddrs,
+		"goaria-torrent-max-active-files": "1",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveTorrentFileIndex(t, started, "first finalized file"); got != 0 {
+		t.Fatalf("first handled file index = %d, want 0", got)
+	}
+	if got := receiveTorrentFileIndex(t, started, "second file before save"); got != 1 {
+		t.Fatalf("second handled file index = %d, want 1", got)
+	}
+	if _, err := engine.Pause(gid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.SaveSession(); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionData, err := os.ReadFile(sessionPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sessionData), "  "+sessionTorrentFinalizedOption+"=1\n") {
+		t.Fatalf("session omitted finalized torrent file state:\n%s", sessionData)
+	}
+
+	restoredIndexes := make(chan int, 2)
+	restored, err := NewEngine(Config{
+		Dir:       dir,
+		InputFile: sessionPath,
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			restoredIndexes <- tf.Lease.Index
+			return tf.Lease.Release(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close(context.Background())
+
+	files, err := restored.GetFiles(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || files[0].CompletedLength != files[0].Length || files[1].CompletedLength == files[1].Length {
+		t.Fatalf("restored per-file progress = %#v, want only first file finalized", files)
+	}
+	status, err := restored.TellStatus(gid, []string{"completedLength"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["completedLength"] != files[0].Length {
+		t.Fatalf("restored completedLength = %v, want %s", status["completedLength"], files[0].Length)
+	}
+	opts, err := restored.GetOption(gid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := opts[sessionTorrentFinalizedOption]; ok {
+		t.Fatalf("private session state leaked through GetOption: %#v", opts)
+	}
+	if _, err := restored.Unpause(gid); err != nil {
+		t.Fatal(err)
+	}
+	if got := receiveTorrentFileIndex(t, restoredIndexes, "restored unfinished file"); got != 1 {
+		t.Fatalf("restored handler received file index %d, want 1", got)
+	}
+	waitForStatus(t, restored, gid, StatusComplete)
+	select {
+	case index := <-restoredIndexes:
+		t.Fatalf("restored handler received extra file index %d", index)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func receiveTorrentFileIndex(t *testing.T, indexes <-chan int, label string) int {
+	t.Helper()
+	select {
+	case index := <-indexes:
+		return index
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+		return -1
 	}
 }
 
@@ -1403,26 +2387,106 @@ func TestTorrentStreamHandlerStartsCompletedFilesWhileEarlierHandlerRuns(t *test
 	defer engine.Close(context.Background())
 
 	gid, err := engine.AddTorrent(encoded, nil, Options{
-		"goaria-disable-dht":      "true",
-		"goaria-disable-trackers": "true",
-		"goaria-disable-utp":      "true",
-		"goaria-peer-addrs":       peerAddrs,
+		"goaria-disable-dht":              "true",
+		"goaria-disable-trackers":         "true",
+		"goaria-disable-utp":              "true",
+		"goaria-torrent-max-active-files": "2",
+		"goaria-peer-addrs":               peerAddrs,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case <-firstStarted:
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("first stream handler did not start")
 	}
 	select {
 	case <-secondStarted:
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("second stream handler did not start while first handler was still running")
 	}
 	close(releaseFirst)
 	waitForStatus(t, engine, gid, StatusComplete)
+}
+
+func TestConcurrentTorrentsDoNotShareSelectedOutputPaths(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+
+	handlerStarted := make(chan string, 4)
+	releaseHandlers := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseHandlers) }) }
+	defer release()
+
+	engine, err := NewEngine(Config{
+		Dir:                    t.TempDir(),
+		MaxConcurrentDownloads: 2,
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			select {
+			case handlerStarted <- tf.GID:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			select {
+			case <-releaseHandlers:
+				return tf.Lease.Release(ctx)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer engine.Close(context.Background())
+
+	opts := Options{
+		"goaria-disable-dht":      "true",
+		"goaria-disable-trackers": "true",
+		"goaria-disable-utp":      "true",
+		"goaria-peer-addrs":       peerAddrs,
+	}
+	first, err := engine.AddTorrent(encoded, nil, opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case startedGID := <-handlerStarted:
+		if startedGID != first {
+			t.Fatalf("first handler gid = %s, want %s", startedGID, first)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("first torrent handler did not start")
+	}
+
+	second, err := engine.AddTorrent(encoded, nil, opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, engine, second, StatusError)
+	status, err := engine.TellStatus(second, []string{"errorMessage"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status["errorMessage"].(string), "output path is already in use") {
+		t.Fatalf("second torrent error = %q", status["errorMessage"])
+	}
+	for {
+		select {
+		case startedGID := <-handlerStarted:
+			if startedGID == second {
+				t.Fatal("conflicting torrent reached the file handler")
+			}
+		default:
+			goto handlersChecked
+		}
+	}
+
+handlersChecked:
+	release()
+	waitForStatus(t, engine, first, StatusComplete)
 }
 
 func TestTorrentStreamLeaseWaitsForExplicitReleaseAndBoundsActiveFiles(t *testing.T) {
@@ -1721,6 +2785,31 @@ func startLocalTorrentSeeder(t *testing.T) (seedDir string, encoded string, peer
 		t.Fatal("seeder has no listen addresses")
 	}
 	return seedDir, base64.StdEncoding.EncodeToString(buf.Bytes()), peerAddrs, stop, want
+}
+
+func v2OnlyTestMetaInfo(t *testing.T) (*metainfo.MetaInfo, metainfo.Info, []byte) {
+	t.Helper()
+	info := metainfo.Info{
+		MetaVersion: 2,
+		PieceLength: 16 << 10,
+		Name:        "v2-only",
+		FileTree: metainfo.FileTree{Dir: map[string]metainfo.FileTree{
+			"payload.bin": {File: metainfo.FileTreeFile{
+				Length:     1,
+				PiecesRoot: string(bytes.Repeat([]byte{0x42}, 32)),
+			}},
+		}},
+	}
+	infoBytes, err := bencode.Marshal(&info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mi := &metainfo.MetaInfo{InfoBytes: infoBytes}
+	var encoded bytes.Buffer
+	if err := mi.Write(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	return mi, info, encoded.Bytes()
 }
 
 func TestTorrentRuntimeReleasedAfterCompletion(t *testing.T) {

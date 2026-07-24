@@ -595,6 +595,25 @@ func TestTorrentPieceProgressUsesVerifiedPieceRuns(t *testing.T) {
 	}
 }
 
+func TestTorrentFileProgressExcludesDirtyUnverifiedBytes(t *testing.T) {
+	snapshot := torrent.FileSnapshot{
+		Length:            100,
+		Completed:         100,
+		VerifiedCompleted: 60,
+	}
+	if got := verifiedTorrentFileProgress(snapshot, snapshot.Length); got != 60 {
+		t.Fatalf("verified file progress = %d, want 60", got)
+	}
+	snapshot.VerifiedCompleted = 101
+	if got := verifiedTorrentFileProgress(snapshot, snapshot.Length); got != 100 {
+		t.Fatalf("clamped verified file progress = %d, want 100", got)
+	}
+	snapshot.VerifiedCompleted = -1
+	if got := verifiedTorrentFileProgress(snapshot, snapshot.Length); got != 0 {
+		t.Fatalf("negative verified file progress = %d, want 0", got)
+	}
+}
+
 func TestTorrentDownloadRateLimitUsesDefaultBoundedBurst(t *testing.T) {
 	cfg := torrent.NewDefaultClientConfig()
 	applyTorrentRateLimitOptions(cfg, Options{"max-download-limit": "2K", "max-upload-limit": "3K"})

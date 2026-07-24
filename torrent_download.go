@@ -1799,10 +1799,7 @@ func (e *Engine) updateTorrentProgress(d *Download, tor *torrent.Torrent) int64 
 		} else if snapshots[i].Released {
 			n = d.torrentFiles[i].Length
 		} else {
-			n = snapshots[i].Completed
-			if n > d.torrentFiles[i].Length {
-				n = d.torrentFiles[i].Length
-			}
+			n = verifiedTorrentFileProgress(snapshots[i], d.torrentFiles[i].Length)
 		}
 		d.torrentFiles[i].Completed = n
 		if d.torrentFiles[i].Selected {
@@ -1816,6 +1813,17 @@ func (e *Engine) updateTorrentProgress(d *Download, tor *torrent.Torrent) int64 
 	d.donePieces = donePieces
 	d.bitfield = bitfield
 	return completed
+}
+
+func verifiedTorrentFileProgress(snapshot torrent.FileSnapshot, length int64) int64 {
+	n := snapshot.VerifiedCompleted
+	if n < 0 {
+		return 0
+	}
+	if n > length {
+		return length
+	}
+	return n
 }
 
 func torrentPieceProgress(runs torrent.PieceStateRuns) (done int64, bitfield string) {

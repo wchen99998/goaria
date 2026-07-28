@@ -2650,6 +2650,66 @@ func TestTorrentStreamHandlerDiscardRemovesStorageOnFailure(t *testing.T) {
 	}
 }
 
+func TestTorrentStreamReaddReleasedFileCompletesWithoutRedelivery(t *testing.T) {
+	_, encoded, peerAddrs, stopSeeder, _ := startLocalTorrentSeeder(t)
+	defer stopSeeder()
+
+	dir := t.TempDir()
+	first, err := NewEngine(Config{
+		Dir: dir,
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			if _, err := io.Copy(io.Discard, tf.Lease.Reader); err != nil {
+				return err
+			}
+			return tf.Lease.Release(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{
+		"select-file":                      "1",
+		"goaria-disable-dht":               "true",
+		"goaria-disable-trackers":          "true",
+		"goaria-disable-utp":               "true",
+		"goaria-peer-addrs":                peerAddrs,
+		"goaria-torrent-max-active-files":  "1",
+		"goaria-torrent-disable-smart-ban": "true",
+	}
+	firstGID, err := first.AddTorrent(encoded, nil, opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, first, firstGID, StatusComplete)
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	handlerCalled := make(chan struct{}, 1)
+	second, err := NewEngine(Config{
+		Dir: dir,
+		TorrentFileHandler: func(ctx context.Context, tf TorrentFile) error {
+			handlerCalled <- struct{}{}
+			return tf.Lease.Release(ctx)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close(context.Background())
+
+	secondGID, err := second.AddTorrent(encoded, nil, opts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, second, secondGID, StatusComplete)
+	select {
+	case <-handlerCalled:
+		t.Fatal("released file was handed to the handler a second time")
+	default:
+	}
+}
+
 func drainStringChannel(ch <-chan string) []string {
 	var out []string
 	for {

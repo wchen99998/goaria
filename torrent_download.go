@@ -1286,6 +1286,9 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	if err := e.refreshTorrentMetadata(d, tor); err != nil {
 		return err
 	}
+	if e.cfg.TorrentFileHandler != nil {
+		e.reconcileReleasedTorrentFiles(d, tor)
+	}
 	opts = d.optionSnapshot()
 	if optionBool(opts, "bt-metadata-only") {
 		e.updateTorrentProgress(d, tor)
@@ -1364,14 +1367,6 @@ func (e *Engine) installTorrentWriteChunkErrorHandler(d *Download, tor *torrent.
 				zap.String("gid", d.gid),
 				zap.Error(err),
 			)
-			return
-		}
-		if errors.Is(err, storage.ErrFileReleased) {
-			e.log.Warn("recovering torrent write to released storage",
-				zap.String("gid", d.gid),
-				zap.Error(err),
-			)
-			tor.AllowDataDownload()
 			return
 		}
 		e.log.Error("torrent write chunk error; disabling data download",
@@ -1576,6 +1571,39 @@ func selectedTorrentFiles(d *Download, files []*torrent.File) []*torrent.File {
 		out = append(out, f)
 	}
 	return out
+}
+
+func (e *Engine) reconcileReleasedTorrentFiles(d *Download, tor *torrent.Torrent) {
+	snapshots := tor.FileSnapshots()
+	reconciled := 0
+	d.mu.Lock()
+	for i := range d.torrentFiles {
+		if i >= len(snapshots) || !snapshots[i].Released {
+			continue
+		}
+		state := &d.torrentFiles[i]
+		if _, ok := d.torrentFinalized[state.Index]; ok {
+			continue
+		}
+		if d.torrentFinalized == nil {
+			d.torrentFinalized = make(map[int]struct{})
+		}
+		d.torrentFinalized[state.Index] = struct{}{}
+		state.Completed = state.Length
+		reconciled++
+	}
+	if reconciled != 0 {
+		d.totalLength, d.completedLen = torrentFileStateProgress(d.torrentFiles, d.torrentFinalized)
+	}
+	d.mu.Unlock()
+	if reconciled == 0 {
+		return
+	}
+	e.log.Info("reconciled released torrent files",
+		zap.String("gid", d.gid),
+		zap.Int("files", reconciled),
+	)
+	e.queueSessionSaveBestEffort()
 }
 
 func (e *Engine) reserveTorrentOutputPaths(d *Download) error {

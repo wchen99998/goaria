@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,7 +30,7 @@ func (e *Engine) GetURIs(gid string) ([]URIInfo, error) {
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return cloneURIs(d.uris), nil
+	return slices.Clone(d.uris), nil
 }
 
 func (e *Engine) GetFiles(gid string) ([]FileInfo, error) {
@@ -322,7 +323,7 @@ func (d *Download) filesLocked() []FileInfo {
 				Length:          strconv.FormatInt(f.Length, 10),
 				CompletedLength: strconv.FormatInt(f.Completed, 10),
 				Selected:        strconv.FormatBool(f.Selected),
-				URIs:            cloneURIs(d.uris),
+				URIs:            slices.Clone(d.uris),
 			})
 		}
 		return out
@@ -344,7 +345,7 @@ func (d *Download) filesLocked() []FileInfo {
 		Length:          strconv.FormatInt(d.totalLength, 10),
 		CompletedLength: strconv.FormatInt(d.completedLen, 10),
 		Selected:        "true",
-		URIs:            cloneURIs(d.uris),
+		URIs:            slices.Clone(d.uris),
 	}}
 }
 
@@ -369,16 +370,10 @@ func sliceDownloads(items []*Download, offset, num int) []*Download {
 	if start < 0 {
 		start = 0
 	}
-	out := make([]*Download, 0, minInt(num, start+1))
+	out := make([]*Download, 0, min(num, start+1))
 	for i := start; i >= 0 && len(out) < num; i-- {
 		out = append(out, items[i])
 	}
-	return out
-}
-
-func cloneURIs(in []URIInfo) []URIInfo {
-	out := make([]URIInfo, len(in))
-	copy(out, in)
 	return out
 }
 

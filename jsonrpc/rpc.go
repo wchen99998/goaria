@@ -356,9 +356,6 @@ func rpcCode(err error) int {
 	if errors.Is(err, goaria.ErrInvalidParams) {
 		return rpcInvalidParams
 	}
-	if errors.Is(err, goaria.ErrUnsupportedMethod) || errors.Is(err, goaria.ErrUnsupportedProtocol) || errors.Is(err, goaria.ErrNotFound) || errors.Is(err, goaria.ErrInvalidGID) {
-		return rpcAriaError
-	}
 	return rpcAriaError
 }
 

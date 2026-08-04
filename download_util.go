@@ -41,14 +41,6 @@ type byteContentRange struct {
 	unsatisfied bool
 }
 
-func parseContentRangeTotal(s string) int64 {
-	cr, ok := parseByteContentRange(s)
-	if !ok || !cr.totalKnown {
-		return -1
-	}
-	return cr.total
-}
-
 func parseByteContentRange(s string) (byteContentRange, bool) {
 	fields := strings.Fields(strings.TrimSpace(s))
 	if len(fields) != 2 || !strings.EqualFold(fields[0], "bytes") {
@@ -517,13 +509,6 @@ func ceilDivInt64(n, d int64) int64 {
 		return 0
 	}
 	return 1 + (n-1)/d
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func isRetryableDownloadError(err error) bool {

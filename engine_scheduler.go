@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -175,7 +176,7 @@ func (e *Engine) remove(gid string) (string, error) {
 		e.mu.Unlock()
 		return "", err
 	}
-	e.waiting = removeString(e.waiting, d.gid)
+	e.waiting = slices.DeleteFunc(e.waiting, func(gid string) bool { return gid == d.gid })
 	d.mu.Lock()
 	if isTerminal(d.status) {
 		d.mu.Unlock()
@@ -213,7 +214,7 @@ func (e *Engine) pause(gid string) (string, error) {
 		e.mu.Unlock()
 		return "", fmt.Errorf("cannot pause stopped download")
 	}
-	e.waiting = removeString(e.waiting, d.gid)
+	e.waiting = slices.DeleteFunc(e.waiting, func(gid string) bool { return gid == d.gid })
 	cancel := d.cancel
 	d.cancel = nil
 	d.status = StatusPaused
@@ -343,16 +344,6 @@ func (e *Engine) gidsByStatus(statuses ...Status) []string {
 	return gids
 }
 
-func (e *Engine) downloadsSnapshot() []*Download {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	out := make([]*Download, 0, len(e.downloads))
-	for _, d := range e.downloads {
-		out = append(out, d)
-	}
-	return out
-}
-
 func newDownload(gid string, uris []string, opts Options) *Download {
 	infos := make([]URIInfo, 0, len(uris))
 	for i, raw := range uris {
@@ -403,23 +394,4 @@ func randomHex(bytesLen int) string {
 
 func isTerminal(s Status) bool {
 	return s == StatusComplete || s == StatusError || s == StatusRemoved
-}
-
-func indexOf(items []string, s string) int {
-	for i, item := range items {
-		if item == s {
-			return i
-		}
-	}
-	return -1
-}
-
-func removeString(items []string, s string) []string {
-	for i := 0; i < len(items); i++ {
-		if items[i] == s {
-			items = append(items[:i], items[i+1:]...)
-			i--
-		}
-	}
-	return items
 }

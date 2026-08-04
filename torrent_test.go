@@ -27,6 +27,12 @@ import (
 	infohash_v2 "github.com/wchen99998/torrent/types/infohash-v2"
 )
 
+func downloadCount(e *Engine) int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.downloads)
+}
+
 func encodeMetaInfo(mi metainfo.MetaInfo) (string, error) {
 	var buf bytes.Buffer
 	if err := bencode.NewEncoder(&buf).Encode(mi); err != nil {
@@ -165,7 +171,7 @@ func TestAddTorrentRejectsMalformedV2InfoBeforeLayout(t *testing.T) {
 			if _, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(meta), nil, Options{"pause": "true"}, nil); err == nil {
 				t.Fatal("AddTorrent accepted malformed v2 metainfo")
 			}
-			if got := len(engine.downloadsSnapshot()); got != 0 {
+			if got := downloadCount(engine); got != 0 {
 				t.Fatalf("malformed torrent registered %d downloads", got)
 			}
 		})
@@ -794,7 +800,7 @@ func TestAddTorrentDirectHonorsMaxTorrentSize(t *testing.T) {
 			t.Fatalf("oversized direct torrent error = %v, want limit %d", err, limit)
 		}
 	}
-	if got := len(engine.downloadsSnapshot()); got != 0 {
+	if got := downloadCount(engine); got != 0 {
 		t.Fatalf("oversized direct torrent registered %d downloads", got)
 	}
 	if _, err := engine.AddTorrent(base64.StdEncoding.EncodeToString(data), nil, Options{
@@ -999,7 +1005,7 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString(data)
 	rawEncoded := strings.TrimRight(encoded, "=")
 	for _, input := range []string{encoded, rawEncoded} {
-		got, err := decodeTorrentParam(input)
+		got, err := decodeTorrentParamUpTo(input, int64(len(input)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1007,7 +1013,7 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 			t.Fatal("decoded torrent did not round-trip")
 		}
 	}
-	if _, err := decodeTorrentParam("not base64!"); err == nil {
+	if _, err := decodeTorrentParamUpTo("not base64!", int64(len("not base64!"))); err == nil {
 		t.Fatal("decodeTorrentParam accepted invalid base64")
 	}
 	if _, _, err := torrentMetaInfo([]byte("d4:info3:bade")); err == nil {
@@ -1017,7 +1023,7 @@ func TestTorrentOptionParsingAndHelpers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	roundTrip, err := decodeTorrentParam(reencoded)
+	roundTrip, err := decodeTorrentParamUpTo(reencoded, int64(len(reencoded)))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -140,17 +140,6 @@ func normalizeOptionValue(v any) any {
 	}
 }
 
-func normalizeOptions(in map[string]any) Options {
-	out := make(Options, len(in))
-	for k, v := range in {
-		if k == optionBaseKey || k == sessionTorrentFinalizedOption || k == sessionExplicitOptionsOption {
-			continue
-		}
-		out[k] = normalizeOptionValue(v)
-	}
-	return out
-}
-
 func (d *Download) optionSnapshot() Options {
 	d.mu.RLock()
 	defer d.mu.RUnlock()

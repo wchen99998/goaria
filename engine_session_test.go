@@ -125,7 +125,7 @@ func TestSessionRoundTripsTorrentAboveDefaultMaxSize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	largeData, err := decodeTorrentParam(encoded)
+	largeData, err := decodeTorrentParamUpTo(encoded, int64(len(encoded)))
 	if err != nil {
 		t.Fatal(err)
 	}

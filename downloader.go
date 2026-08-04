@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -287,13 +288,6 @@ type rateLimiter struct {
 	parent    *rateLimiter
 }
 
-func newRateLimiter(limit int64) *rateLimiter {
-	if limit <= 0 {
-		return nil
-	}
-	return &rateLimiter{limit: limit}
-}
-
 func newDynamicRateLimiter(limit func() int64) *rateLimiter {
 	return &rateLimiter{limitFunc: limit}
 }
@@ -423,7 +417,7 @@ func (e *Engine) runDownload(d *Download) error {
 		oneURI[0] = d.uris[0]
 		uris = oneURI[:]
 	} else {
-		uris = cloneURIs(d.uris)
+		uris = slices.Clone(d.uris)
 	}
 	d.mu.RUnlock()
 	if ctx == nil {
@@ -493,7 +487,7 @@ func (e *Engine) downloadURI(ctx context.Context, d *Download, rawURI string, op
 	if maxConn < 1 {
 		maxConn = 1
 	}
-	initialConcurrency := minInt(split, maxConn)
+	initialConcurrency := min(split, maxConn)
 	segmentedRequested := split > 1
 	minSplit := optionBytes(opts, "min-split-size", 1<<20)
 	limiter := newDynamicRateLimiter(func() int64 {
@@ -898,7 +892,7 @@ func (e *Engine) segmentedWorkerLimit(d *Download, fallback Options, max int) in
 	if maxConn < 1 {
 		maxConn = 1
 	}
-	limit := minInt(split, maxConn)
+	limit := min(split, maxConn)
 	if limit > max {
 		limit = max
 	}

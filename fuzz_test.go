@@ -23,9 +23,8 @@ func FuzzParseContentRangeTotal(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
-		total := parseContentRangeTotal(s)
-		if total < -1 {
-			t.Fatalf("parseContentRangeTotal(%q) = %d", s, total)
+		if cr, ok := parseByteContentRange(s); ok && cr.totalKnown && cr.total < 0 {
+			t.Fatalf("parseByteContentRange(%q) total = %d", s, cr.total)
 		}
 	})
 }
@@ -95,7 +94,7 @@ func FuzzOptionsAndSizes(f *testing.F) {
 		if len(sizeRaw) > 256 || len(boolRaw) > 256 || len(versionRaw) > 256 {
 			t.Skip()
 		}
-		opts := normalizeOptions(map[string]any{
+		opts := mergeOptions(nil, map[string]any{
 			"size":         sizeRaw,
 			"enabled":      boolRaw,
 			"http-version": versionRaw,

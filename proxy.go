@@ -19,6 +19,7 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/http2"
+	xproxy "golang.org/x/net/proxy"
 )
 
 const maxCachedTransports = 256
@@ -592,11 +593,29 @@ func newTransport(cfg proxyConfig) *http.Transport {
 	bypassProxy := explicitProxyBypassFunc(cfg.noProxy)
 	dialContext := dialer.DialContext
 	if cfg.socksAddr != "" {
+		var auth *xproxy.Auth
+		if cfg.socksUser != "" {
+			auth = &xproxy.Auth{User: cfg.socksUser, Password: cfg.socksPass}
+		}
+		socksDialer, _ := xproxy.SOCKS5("tcp", cfg.socksAddr, auth, dialer)
+		dialSOCKS := socksDialer.(xproxy.ContextDialer).DialContext
 		dialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if bypassProxy(&url.URL{Scheme: cfg.scheme, Host: addr}) {
 				return dialer.DialContext(ctx, network, addr)
 			}
-			return dialSOCKS5(ctx, dialer, cfg.socksAddr, cfg.socksUser, cfg.socksPass, network, addr)
+			if dialer.Timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, dialer.Timeout)
+				defer cancel()
+			}
+			conn, err := dialSOCKS(ctx, network, addr)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if conn != nil {
+					_ = conn.Close()
+				}
+				return nil, ctxErr
+			}
+			return conn, err
 		}
 	}
 	tr := &http.Transport{

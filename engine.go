@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -412,7 +413,7 @@ func (e *Engine) ChangePosition(gid string, pos int, how string) (int, error) {
 		e.mu.Unlock()
 		return 0, err
 	}
-	idx := indexOf(e.waiting, d.gid)
+	idx := slices.Index(e.waiting, d.gid)
 	if idx < 0 {
 		e.mu.Unlock()
 		return 0, fmt.Errorf("download is not in waiting queue")
@@ -724,7 +725,7 @@ func (e *Engine) restartActiveDownloadLocked(d *Download) context.CancelFunc {
 	d.status = StatusWaiting
 	d.connections = 0
 	d.downloadBPS = 0
-	if indexOf(e.waiting, d.gid) < 0 {
+	if slices.Index(e.waiting, d.gid) < 0 {
 		e.waiting = append(e.waiting, d.gid)
 	}
 	cancel := d.cancel
@@ -863,7 +864,7 @@ func (e *Engine) RemoveDownloadResult(gid string) (string, error) {
 	}
 	delete(e.downloads, d.gid)
 	delete(e.stoppedSet, d.gid)
-	e.stopped = removeString(e.stopped, d.gid)
+	e.stopped = slices.DeleteFunc(e.stopped, func(gid string) bool { return gid == d.gid })
 	e.mu.Unlock()
 	e.saveSessionBestEffort()
 	return "OK", nil

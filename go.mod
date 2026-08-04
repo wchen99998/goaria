@@ -6,7 +6,6 @@ require (
 	github.com/anacrolix/generics v0.2.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/quic-go/quic-go v0.59.0
-	github.com/ryanolee/go-chaff v0.3.5
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	go.uber.org/zap v1.27.0
 	golang.org/x/net v0.47.0
@@ -92,9 +91,7 @@ require (
 )
 
 require (
-	github.com/go-faker/faker/v4 v4.6.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/thoas/go-funk v0.9.3 // indirect
 	github.com/wchen99998/torrent v1.54.10
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.44.0 // indirect

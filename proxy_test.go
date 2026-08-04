@@ -288,41 +288,18 @@ func TestResponseBodyTimeoutOnlyRunsDuringRead(t *testing.T) {
 	}
 }
 
-func TestSOCKSHandshakeDoesNotConsumeBufferedTargetBytes(t *testing.T) {
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-	payload := []byte("target-response")
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- serveSOCKSHandshake(server, payload)
-	}()
-
-	if err := client.SetDeadline(time.Now().Add(time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if err := socks5Handshake(client, "", "", "example.test:80"); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(client, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("target payload = %q, want %q", got, payload)
-	}
-	if err := <-serverErr; err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestSOCKSDialHandshakeHonorsContextCancellation(t *testing.T) {
 	proxyAddr, accepted, closeProxy := startStallingSOCKSProxy(t)
 	defer closeProxy()
 	ctx, cancel := context.WithCancel(context.Background())
+	transport := newTransport(proxyConfig{
+		scheme:         "http",
+		socksAddr:      proxyAddr,
+		connectTimeout: 5 * time.Second,
+	})
 	done := make(chan error, 1)
 	go func() {
-		_, err := dialSOCKS5(ctx, &net.Dialer{Timeout: 5 * time.Second}, proxyAddr, "", "", "tcp", "example.test:80")
+		_, err := transport.DialContext(ctx, "tcp", "example.test:80")
 		done <- err
 	}()
 	select {
@@ -344,9 +321,14 @@ func TestSOCKSDialHandshakeHonorsContextCancellation(t *testing.T) {
 func TestSOCKSDialHandshakeHonorsDialerTimeout(t *testing.T) {
 	proxyAddr, accepted, closeProxy := startStallingSOCKSProxy(t)
 	defer closeProxy()
+	transport := newTransport(proxyConfig{
+		scheme:         "http",
+		socksAddr:      proxyAddr,
+		connectTimeout: 100 * time.Millisecond,
+	})
 	done := make(chan error, 1)
 	go func() {
-		_, err := dialSOCKS5(context.Background(), &net.Dialer{Timeout: 100 * time.Millisecond}, proxyAddr, "", "", "tcp", "example.test:80")
+		_, err := transport.DialContext(context.Background(), "tcp", "example.test:80")
 		done <- err
 	}()
 	select {
@@ -414,46 +396,6 @@ func proxyURLFor(t *testing.T, transport *http.Transport, rawURL string) *url.UR
 		t.Fatal(err)
 	}
 	return proxy
-}
-
-func serveSOCKSHandshake(conn net.Conn, payload []byte) error {
-	var greeting [2]byte
-	if _, err := io.ReadFull(conn, greeting[:]); err != nil {
-		return err
-	}
-	methods := make([]byte, int(greeting[1]))
-	if _, err := io.ReadFull(conn, methods); err != nil {
-		return err
-	}
-	if err := writeAll(conn, []byte{0x05, 0x00}); err != nil {
-		return err
-	}
-	var requestHeader [4]byte
-	if _, err := io.ReadFull(conn, requestHeader[:]); err != nil {
-		return err
-	}
-	switch requestHeader[3] {
-	case 0x01:
-		if _, err := io.ReadFull(conn, make([]byte, 4+2)); err != nil {
-			return err
-		}
-	case 0x03:
-		var length [1]byte
-		if _, err := io.ReadFull(conn, length[:]); err != nil {
-			return err
-		}
-		if _, err := io.ReadFull(conn, make([]byte, int(length[0])+2)); err != nil {
-			return err
-		}
-	case 0x04:
-		if _, err := io.ReadFull(conn, make([]byte, 16+2)); err != nil {
-			return err
-		}
-	default:
-		return errors.New("unexpected SOCKS address type")
-	}
-	reply := append([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}, payload...)
-	return writeAll(conn, reply)
 }
 
 func startStallingSOCKSProxy(t *testing.T) (string, <-chan struct{}, func()) {

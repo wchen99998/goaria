@@ -652,7 +652,7 @@ func TestRateLimiterWaitHonorsCancellation(t *testing.T) {
 	cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- newRateLimiter(1).wait(ctx, 2)
+		done <- (&rateLimiter{limit: 1}).wait(ctx, 2)
 	}()
 
 	select {
@@ -666,7 +666,7 @@ func TestRateLimiterWaitHonorsCancellation(t *testing.T) {
 }
 
 func TestCanceledRateLimiterWaitDoesNotPoisonSharedLimiter(t *testing.T) {
-	limiter := newRateLimiter(1)
+	limiter := &rateLimiter{limit: 1}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- limiter.wait(ctx, 2) }()
@@ -686,7 +686,7 @@ func TestCanceledRateLimiterWaitDoesNotPoisonSharedLimiter(t *testing.T) {
 func TestDynamicAndOverallRateLimitersRefreshLimits(t *testing.T) {
 	var limit atomic.Int64
 	local := newDynamicRateLimiter(limit.Load)
-	overall := newRateLimiter(1 << 30)
+	overall := &rateLimiter{limit: 1 << 30}
 	local.parent = overall
 
 	if err := local.wait(context.Background(), 1); err != nil {
@@ -713,7 +713,7 @@ func TestDynamicAndOverallRateLimitersRefreshLimits(t *testing.T) {
 
 func TestRateLimiterDoesNotBankIdleCreditOrDoubleDelayParents(t *testing.T) {
 	now := time.Now()
-	limiter := newRateLimiter(100)
+	limiter := &rateLimiter{limit: 100}
 	if got := limiter.reservationDeadline(now, 100).Sub(now); got != time.Second {
 		t.Fatalf("first reservation delay = %v, want 1s", got)
 	}
@@ -722,8 +722,8 @@ func TestRateLimiterDoesNotBankIdleCreditOrDoubleDelayParents(t *testing.T) {
 		t.Fatalf("reservation after idle = %v, want 1s without banked credit", got)
 	}
 
-	child := newRateLimiter(100)
-	child.parent = newRateLimiter(100)
+	child := &rateLimiter{limit: 100}
+	child.parent = &rateLimiter{limit: 100}
 	if got := child.reservationDeadline(now, 100).Sub(now); got != time.Second {
 		t.Fatalf("composed limiter delay = %v, want max(parent, child)=1s", got)
 	}

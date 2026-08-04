@@ -10,11 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -585,18 +587,6 @@ func v2TorrentLength(tree *metainfo.FileTree) (int64, error) {
 	return total, lengthErr
 }
 
-func decodeTorrentParam(s string) ([]byte, error) {
-	data, err := base64.StdEncoding.DecodeString(s)
-	if err == nil {
-		return data, nil
-	}
-	data, rawErr := base64.RawStdEncoding.DecodeString(s)
-	if rawErr == nil {
-		return data, nil
-	}
-	return nil, fmt.Errorf("invalid base64 torrent: %w", err)
-}
-
 func decodeTorrentParamUpTo(s string, maxSize int64) ([]byte, error) {
 	decode := func(encoding *base64.Encoding) ([]byte, error) {
 		limit := maxSize
@@ -835,17 +825,6 @@ func torrentSelectedLength(files []torrentFileState) int64 {
 	return total
 }
 
-func cloneTorrentFinalizedIndexes(indexes map[int]struct{}) map[int]struct{} {
-	if len(indexes) == 0 {
-		return nil
-	}
-	out := make(map[int]struct{}, len(indexes))
-	for index := range indexes {
-		out[index] = struct{}{}
-	}
-	return out
-}
-
 func validateTorrentFinalizedIndexes(files []torrentFileState, finalized map[int]struct{}) error {
 	if len(finalized) == 0 {
 		return nil
@@ -890,7 +869,7 @@ func (d *Download) restoreTorrentFinalized(indexes map[int]struct{}) error {
 			return err
 		}
 	}
-	d.torrentFinalized = cloneTorrentFinalizedIndexes(indexes)
+	d.torrentFinalized = maps.Clone(indexes)
 	d.totalLength, d.completedLen = torrentFileStateProgress(d.torrentFiles, d.torrentFinalized)
 	// Without a live torrent there is no verified per-piece state. Preserve
 	// completed byte/file accounting without fabricating a contiguous prefix.
@@ -1188,7 +1167,7 @@ func (e *Engine) runTorrentDownload(d *Download) error {
 	opts := d.options
 	data := append([]byte(nil), d.torrentData...)
 	magnet := d.torrentMagnet
-	webseeds := cloneURIs(d.uris)
+	webseeds := slices.Clone(d.uris)
 	dir := d.dir
 	d.mu.RUnlock()
 	if ctx == nil {
@@ -1558,7 +1537,7 @@ func (e *Engine) refreshTorrentMetadata(d *Download, tor *torrent.Torrent) error
 func selectedTorrentFiles(d *Download, files []*torrent.File) []*torrent.File {
 	d.mu.RLock()
 	states := append([]torrentFileState(nil), d.torrentFiles...)
-	finalized := cloneTorrentFinalizedIndexes(d.torrentFinalized)
+	finalized := maps.Clone(d.torrentFinalized)
 	d.mu.RUnlock()
 	out := make([]*torrent.File, 0, len(files))
 	for i, f := range files {

@@ -87,6 +87,7 @@ type Download struct {
 	totalLength  int64
 	completedLen int64
 	downloadBPS  int64
+	uploadBPS    int64
 	connections  int
 	pieceLength  int64
 	numPieces    int64
@@ -724,6 +725,7 @@ func (e *Engine) restartActiveDownloadLocked(d *Download) context.CancelFunc {
 	d.status = StatusWaiting
 	d.connections = 0
 	d.downloadBPS = 0
+	d.uploadBPS = 0
 	if indexOf(e.waiting, d.gid) < 0 {
 		e.waiting = append(e.waiting, d.gid)
 	}

@@ -1776,29 +1776,28 @@ func (e *Engine) handleCompletedTorrentFile(ctx context.Context, d *Download, le
 func (e *Engine) startTorrentProgress(ctx context.Context, d *Download, tor *torrent.Torrent) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
+	lastStats, lastAt := e.updateTorrentProgress(d, tor)
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		lastCompleted := e.updateTorrentProgress(d, tor)
-		var lastAt = time.Now()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-stop:
 				return
-			case now := <-ticker.C:
-				completed := e.updateTorrentProgress(d, tor)
+			case <-ticker.C:
+				stats, now := e.updateTorrentProgress(d, tor)
 				elapsed := now.Sub(lastAt)
 				if elapsed > 0 {
-					delta := completed - lastCompleted
-					if delta < 0 {
-						delta = 0
-					}
-					d.setDownloadBPS(bytesPerSecond(delta, elapsed))
+					// Verified progress can advance from local rechecks or lag behind
+					// received chunks. Measure payload counters independently.
+					received := max(0, stats.BytesReadUsefulData.Int64()-lastStats.BytesReadUsefulData.Int64())
+					sent := max(0, stats.BytesWrittenData.Int64()-lastStats.BytesWrittenData.Int64())
+					d.setTransferBPS(bytesPerSecond(received, elapsed), bytesPerSecond(sent, elapsed))
 				}
-				lastCompleted = completed
+				lastStats = stats
 				lastAt = now
 			}
 		}
@@ -1810,8 +1809,9 @@ func (e *Engine) startTorrentProgress(ctx context.Context, d *Download, tor *tor
 	}
 }
 
-func (e *Engine) updateTorrentProgress(d *Download, tor *torrent.Torrent) int64 {
+func (e *Engine) updateTorrentProgress(d *Download, tor *torrent.Torrent) (torrent.TorrentStats, time.Time) {
 	stats := tor.Stats()
+	sampledAt := time.Now()
 	snapshots := tor.FileSnapshots()
 	donePieces, bitfield := torrentPieceProgress(tor.PieceStateRuns())
 	d.mu.Lock()
@@ -1840,7 +1840,7 @@ func (e *Engine) updateTorrentProgress(d *Download, tor *torrent.Torrent) int64 
 	d.seeder = tor.Seeding()
 	d.donePieces = donePieces
 	d.bitfield = bitfield
-	return completed
+	return stats, sampledAt
 }
 
 func verifiedTorrentFileProgress(snapshot torrent.FileSnapshot, length int64) int64 {

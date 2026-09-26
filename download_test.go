@@ -621,7 +621,7 @@ func runActiveSegmentedConnectionScaleTest(t *testing.T, adjust func(*Engine, st
 }
 
 func TestDownloadSpeedTrackerAggregatesConcurrentWorkers(t *testing.T) {
-	d := &Download{}
+	d := &Download{status: StatusActive}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tracker := startDownloadSpeedTrackerWithInterval(ctx, d, 100*time.Millisecond)

@@ -149,7 +149,15 @@ func (d *Download) setConnections(n int) {
 }
 
 func (d *Download) setDownloadBPS(n int64) {
+	d.setTransferBPS(n, 0)
+}
+
+func (d *Download) setTransferBPS(download, upload int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.downloadBPS = n
+	if d.status != StatusActive {
+		return
+	}
+	d.downloadBPS = download
+	d.uploadBPS = upload
 }

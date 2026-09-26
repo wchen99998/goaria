@@ -59,6 +59,7 @@ func (e *Engine) schedule() {
 		d.errorCode = ""
 		d.errorMessage = ""
 		d.downloadBPS = 0
+		d.uploadBPS = 0
 		d.connections = 0
 		d.mu.Unlock()
 		e.active[gid] = struct{}{}
@@ -125,6 +126,7 @@ func (e *Engine) finishDownload(d *Download, runCtx context.Context, err error) 
 		d.cancel = nil
 		d.connections = 0
 		d.downloadBPS = 0
+		d.uploadBPS = 0
 		d.stoppedAt = time.Now()
 		if err == nil {
 			d.status = StatusComplete
@@ -187,6 +189,7 @@ func (e *Engine) remove(gid string) (string, error) {
 	d.status = StatusRemoved
 	d.connections = 0
 	d.downloadBPS = 0
+	d.uploadBPS = 0
 	d.stoppedAt = time.Now()
 	d.mu.Unlock()
 	e.appendStoppedLocked(d.gid)
@@ -219,6 +222,7 @@ func (e *Engine) pause(gid string) (string, error) {
 	d.status = StatusPaused
 	d.connections = 0
 	d.downloadBPS = 0
+	d.uploadBPS = 0
 	d.mu.Unlock()
 	e.mu.Unlock()
 	if cancel != nil {

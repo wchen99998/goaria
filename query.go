@@ -123,7 +123,7 @@ func (e *Engine) TellStopped(offset, num int, keys []string) []map[string]any {
 func (e *Engine) GetGlobalStat() GlobalStat {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	var speed int64
+	var downloadSpeed, uploadSpeed int64
 	active := 0
 	waiting := 0
 	for _, d := range e.downloads {
@@ -131,10 +131,15 @@ func (e *Engine) GetGlobalStat() GlobalStat {
 		switch d.status {
 		case StatusActive:
 			active++
-			if d.downloadBPS > math.MaxInt64-speed {
-				speed = math.MaxInt64
+			if d.downloadBPS > math.MaxInt64-downloadSpeed {
+				downloadSpeed = math.MaxInt64
 			} else if d.downloadBPS > 0 {
-				speed += d.downloadBPS
+				downloadSpeed += d.downloadBPS
+			}
+			if d.uploadBPS > math.MaxInt64-uploadSpeed {
+				uploadSpeed = math.MaxInt64
+			} else if d.uploadBPS > 0 {
+				uploadSpeed += d.uploadBPS
 			}
 		case StatusWaiting, StatusPaused:
 			waiting++
@@ -142,8 +147,8 @@ func (e *Engine) GetGlobalStat() GlobalStat {
 		d.mu.RUnlock()
 	}
 	return GlobalStat{
-		DownloadSpeed:   strconv.FormatInt(speed, 10),
-		UploadSpeed:     "0",
+		DownloadSpeed:   strconv.FormatInt(downloadSpeed, 10),
+		UploadSpeed:     strconv.FormatInt(uploadSpeed, 10),
 		NumActive:       strconv.Itoa(active),
 		NumWaiting:      strconv.Itoa(waiting),
 		NumStopped:      strconv.Itoa(len(e.stopped)),
@@ -229,7 +234,7 @@ func (d *Download) snapshot(keys []string) map[string]any {
 			"completedLength": strconv.FormatInt(d.completedLen, 10),
 			"uploadLength":    "0",
 			"downloadSpeed":   strconv.FormatInt(d.downloadBPS, 10),
-			"uploadSpeed":     "0",
+			"uploadSpeed":     strconv.FormatInt(d.uploadBPS, 10),
 			"connections":     strconv.Itoa(d.connections),
 			"numPieces":       strconv.FormatInt(d.numPieces, 10),
 			"pieceLength":     strconv.FormatInt(d.pieceLength, 10),
@@ -270,7 +275,7 @@ func (d *Download) snapshot(keys []string) map[string]any {
 		case "downloadSpeed":
 			filtered[key] = strconv.FormatInt(d.downloadBPS, 10)
 		case "uploadSpeed":
-			filtered[key] = "0"
+			filtered[key] = strconv.FormatInt(d.uploadBPS, 10)
 		case "connections":
 			filtered[key] = strconv.Itoa(d.connections)
 		case "numPieces":
